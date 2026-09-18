@@ -1,0 +1,771 @@
+//
+//  RootView.swift
+//  TLocation
+//
+
+import SwiftUI
+import UIKit
+
+private enum RootViewLinks {
+    static let localDevVPNAppStore = URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!
+
+    /// Tried in order. SideStore renamed itself out of the AltStore lineage but both
+    /// schemes are still in the wild, so guess the current one first and let the
+    /// website catch anyone running neither.
+    static let sideStore: [URL] = [
+        URL(string: "sidestore://")!,
+        URL(string: "altstore://")!,
+        URL(string: "https://sidestore.io")!
+    ]
+
+    /// Current LocalDevVPN releases can enable the tunnel from their URL scheme
+    /// and jump straight back to this app.  Keep the legacy StosVPN scheme as a
+    /// fallback for older installs.
+    static let localDevVPN: [URL] = [
+        URL(string: "localdevvpn://enable?scheme=flyingmushroomv2")!,
+        URL(string: "stosvpn://")!,
+        localDevVPNAppStore
+    ]
+
+    /// Cellular-only RemotePairing needs a short Airplane Mode transition while
+    /// LocalDevVPN owns the screen.  This URL deliberately has no callback: the
+    /// user must enable Airplane Mode before returning to TLocation.
+    static let localDevVPNCellularStart: [URL] = [
+        URL(string: "localdevvpn://enable")!,
+        URL(string: "stosvpn://")!,
+        localDevVPNAppStore
+    ]
+}
+
+/// Opens the first URL in `candidates` that the system actually resolves, chaining
+/// through `open`'s completion handler.
+///
+/// Deliberately declaration-free: no `LSApplicationQueriesSchemes` entry and no
+/// `canOpenURL` check. A scheme that does not resolve — app missing, or renamed
+/// since LocalDevVPN was StosVPN — just reports failure and hands off to the next
+/// candidate, so a wrong guess costs nothing but is invisible to the user.
+///
+/// A free function rather than a method so the recursive step does not have to
+/// capture the enclosing `View` value in an escaping closure.
+private func openFirstResolving(_ candidates: [URL]) {
+    guard let next = candidates.first else { return }
+    UIApplication.shared.open(next) { success in
+        guard !success else { return }
+        openFirstResolving(Array(candidates.dropFirst()))
+    }
+}
+
+private enum ExternalLocationAction: Identifiable {
+    case simulate(URL, Double, Double)
+    case clear
+
+    var id: String {
+        switch self {
+        case .simulate(let url, _, _): return "simulate-\(url.absoluteString)"
+        case .clear: return "clear-location"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .simulate: return String(localized: "Simulate Location?")
+        case .clear: return String(localized: "Clear Location?")
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .simulate(_, let latitude, let longitude):
+            // Formatted first so the sentence carries one ready-made
+            // coordinate string rather than two bare numbers a translator
+            // would have to keep in the English order.
+            let coordinate = String(format: "%.6f, %.6f", latitude, longitude)
+            return String(localized: "An external link wants to set the simulated location to \(coordinate).")
+        case .clear:
+            return String(localized: "An external link wants to clear the simulated location.")
+        }
+    }
+
+    var confirmationTitle: String {
+        switch self {
+        case .simulate: return String(localized: "Set Location")
+        case .clear: return String(localized: "Clear Location")
+        }
+    }
+}
+
+struct RootView: View {
+    @ObservedObject private var tunnel = TunnelManager.shared
+    @ObservedObject private var mounting = MountingProgress.shared
+    @ObservedObject private var signing = SigningExpiryMonitor.shared
+
+    @Environment(\.scenePhase) private var scenePhase
+
+    @State private var isShowingPairingFilePicker = false
+    @State private var isShowingSettings = false
+    @State private var isShowingCellularStartGuide = false
+    // AppStorage is intentional: iOS may reclaim the host app while the user is
+    // in LocalDevVPN or toggling Airplane Mode.  The guide must still know which
+    // step it was on when this process is created again.
+    @AppStorage("cellularStartGuideActive") private var isCellularStartGuideActive = false
+    @AppStorage("cellularLocationSessionStarted") private var cellularLocationSessionStarted = false
+    @State private var pendingLocationAction: ExternalLocationAction?
+    @State private var pairingExists = FileManager.default.fileExists(
+        atPath: PairingFileStore.prepareURL().path
+    )
+    @State private var isShowingExpiryWarning = false
+    @State private var suppressExpiryWarning = false
+    /// The expiry warning is decided once per launch — but only once there is
+    /// something to decide *with*. Without this, dismissing with "Later" would
+    /// only last until the app next came back to the foreground.
+    @State private var hasEvaluatedExpiryWarning = false
+
+    private let statusTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    private var isReady: Bool {
+        pairingExists && tunnel.isConnected && mounting.coolisMounted
+    }
+
+    var body: some View {
+        NavigationStack {
+            // Until pairing + tunnel + DDI are all up, every control on the map is
+            // disabled anyway. Rather than leave a normal-looking but silently dead
+            // map, cover it with a blocking readiness overlay that says exactly what
+            // is missing. The overlay is the last child of the ZStack (drawn on top)
+            // and the map explicitly stops hit-testing beneath it, so nothing can be
+            // tapped through — no accidental pin drops. A safe-area inset banner was
+            // used here before and did not render on device, because the map below
+            // discards the safe area.
+            ZStack {
+                LocationSimulationView()
+                    .allowsHitTesting(isReady && !isShowingExpiryWarning)
+
+                // Strictly one card at a time — `else if`, not two independent
+                // `if`s, so the two can never stack on top of each other. The
+                // expiry warning wins: an unreadable map is recoverable in
+                // seconds, a lapsed signature means a reinstall. Dismissing it
+                // reveals the readiness overlay underneath, whose blocking
+                // behaviour is unchanged (the map stops hit-testing for either).
+                if isShowingExpiryWarning {
+                    expiryOverlay
+                } else if !isReady {
+                    readinessOverlay
+                }
+
+                if isReady && isCellularStartGuideActive {
+                    cellularStartMapGuide
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: isReady)
+            .animation(.easeInOut(duration: 0.2), value: isShowingExpiryWarning)
+        }
+        .sheet(isPresented: $isShowingSettings) {
+            SettingsView()
+        }
+        .fileImporter(
+            isPresented: $isShowingPairingFilePicker,
+            allowedContentTypes: PairingFileStore.supportedContentTypes
+        ) { result in
+            importPairingFile(result)
+        }
+        .onAppear {
+            if isCellularStartGuideActive && !LocationSimulationSession.isOpen {
+                cellularLocationSessionStarted = false
+            }
+            // A cold launch with Wi-Fi unavailable is an expected V2 workflow,
+            // not an error that should cover the recovery controls with a modal
+            // alert.  Try once silently; the readiness card remains visible and
+            // offers both the normal and cellular-only LocalDevVPN launch paths.
+            startTunnelInBackground(showErrorUI: false)
+            MountingProgress.shared.checkforMounted()
+            signing.refreshIfPossible(reason: "launch")
+            evaluateExpiryWarning()
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                signing.refreshIfPossible(reason: "a return to the foreground")
+                evaluateExpiryWarning()
+            }
+        }
+        // The tunnel is almost never up at the instant `onAppear` runs, so this is
+        // the edge that actually gets the first read of a cold launch taken.
+        .onChange(of: tunnel.isConnected) { _, isConnected in
+            if isConnected { signing.refreshIfPossible(reason: "the tunnel connecting") }
+        }
+        // A reading landing seconds after launch is the normal case, so the
+        // decision is retried whenever one does rather than only at `onAppear`.
+        .onChange(of: signing.reading) { _, _ in
+            evaluateExpiryWarning()
+        }
+        .onReceive(statusTimer) { _ in
+            // Cheap existence check only. `prepareURL()` does directory creation and a
+            // full byte-compare, which must not run on the main thread once per second.
+            pairingExists = FileManager.default.fileExists(atPath: PairingFileStore.url.path)
+            if mounting.mountingThread == nil, !mounting.coolisMounted {
+                MountingProgress.shared.checkforMounted()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showPairingFilePicker)) { _ in
+            isShowingPairingFilePicker = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .locationSimulationSessionStarted)) { _ in
+            if isCellularStartGuideActive {
+                cellularLocationSessionStarted = true
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .locationSimulationSessionEnded)) { _ in
+            if isCellularStartGuideActive {
+                cellularLocationSessionStarted = false
+            }
+        }
+        .onOpenURL { url in
+            handleURL(url)
+        }
+        .alert("4G 離線啟動", isPresented: $isShowingCellularStartGuide) {
+            Button("取消", role: .cancel) {}
+            Button("開始") {
+                isCellularStartGuideActive = true
+                cellularLocationSessionStarted = false
+                openLocalDevVPNForCellularStart()
+            }
+        } message: {
+            Text("1. 關閉 Wi-Fi，保持 4G 開啟\n2. 到 LocalDevVPN 等待顯示已連線\n3. 留在 LocalDevVPN，開啟飛航模式\n4. 手動回到飛菇，等待三項準備完成\n5. 飛航模式先別關，先模擬定位或啟動路線\n6. 看到綠色「定位已建立」後，再關飛航恢復 4G")
+        }
+        .confirmationDialog(
+            pendingLocationAction?.title ?? String(localized: "External Location Request"),
+            isPresented: Binding(
+                get: { pendingLocationAction != nil },
+                set: { if !$0 { pendingLocationAction = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingLocationAction
+        ) { action in
+            Button(action.confirmationTitle, role: .destructive) {
+                performLocationAction(action)
+                pendingLocationAction = nil
+            }
+            Button("Cancel", role: .cancel) { pendingLocationAction = nil }
+        } message: { action in
+            Text(action.message)
+        }
+    }
+
+    // MARK: - Signing expiry warning
+
+    /// Expiry the card speaks about: whatever the device last told us, or `nil`
+    /// when it has never been asked or answered "no profile for this app".
+    private var expiryDate: Date? { signing.reading?.expirationDate }
+
+    private var signatureHasExpired: Bool {
+        expiryDate.map { AppSigningInfo.hasExpired($0) } ?? false
+    }
+
+    /// Decides once per launch whether to warn that the signature is about to
+    /// lapse — but only once there is a reading worth deciding on.
+    ///
+    /// The two ways of knowing nothing are both silence, never a warning:
+    ///
+    /// * `signing.reading == nil` — the device has never been reachable, so
+    ///   there is no expiry, only an absence. A device that cannot be read is
+    ///   not a device whose signature has lapsed.
+    /// * `signing.reading?.expirationDate == nil` — the device answered and
+    ///   carries no profile for this app (App Store or TrollStore install).
+    ///
+    /// Neither marks the decision as made: a reading can still arrive seconds
+    /// later, when the tunnel comes up, and `onChange(of: signing.reading)` calls
+    /// back in. Only a trustworthy reading closes the question, and from then on
+    /// every early return marks it made, so "Later" holds for the rest of the
+    /// session even across foreground/background cycles.
+    private func evaluateExpiryWarning() {
+        guard !hasEvaluatedExpiryWarning else { return }
+
+        // A reading older than the trust window can only ever cry wolf (an expiry
+        // moves later, never earlier), so it is not allowed to raise the card —
+        // and it does not settle the question either, because a fresh read may
+        // still land this session.
+        guard let expiry = signing.reading?.expirationDate, signing.isTrustworthy else { return }
+
+        hasEvaluatedExpiryWarning = true
+
+        guard AppSigningInfo.isExpiringSoon(expiry) else { return }
+
+        // Suppression is keyed to this exact expiry date, so a SideStore refresh —
+        // new certificate, new expiry — starts warning again next week. Now that
+        // the date is read from the device it actually moves, which is what makes
+        // the checkbox mean what it says.
+        guard !ExpiryWarningSuppression.isSuppressed(expiry) else { return }
+
+        isShowingExpiryWarning = true
+    }
+
+    private func dismissExpiryWarning() {
+        if suppressExpiryWarning, let expiry = expiryDate {
+            ExpiryWarningSuppression.suppress(expiry)
+        }
+        isShowingExpiryWarning = false
+    }
+
+    private var expiryTitle: String {
+        guard let expiry = expiryDate, !AppSigningInfo.hasExpired(expiry) else {
+            return String(localized: "TLocation has expired")
+        }
+        let duration = AppSigningInfo.durationPhrase(expiry.timeIntervalSinceNow)
+        return String(localized: "TLocation expires in \(duration)")
+    }
+
+    private var expiryBody: String {
+        signatureHasExpired
+            ? String(localized: "The signing certificate for this install has lapsed, so TLocation will not launch again until it is re-signed. Open SideStore and refresh TLocation to fix it.")
+            : String(localized: "Open SideStore and refresh TLocation to re-sign it. If the signature fully expires the app will not launch and must be reinstalled.")
+    }
+
+    /// Same visual language as the readiness overlay: full-screen material scrim
+    /// plus a rounded material card. Uses no iOS-26-only API, so it needs no
+    /// availability gate — `.regularMaterial` is the floor on iOS 17.4.
+    private var expiryOverlay: some View {
+        ZStack {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .ignoresSafeArea()
+
+            expiryCard
+                .padding(.horizontal, 24)
+        }
+        .transition(.opacity)
+    }
+
+    private var expiryCard: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(expiryTitle, systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                    .foregroundStyle(signatureHasExpired ? .red : .orange)
+                Text(expiryBody)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Refreshing keeps your pairing file and bookmarks.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Toggle(isOn: $suppressExpiryWarning) {
+                Text("Don't show again for this expiry")
+                    .font(.subheadline)
+            }
+
+            VStack(spacing: 10) {
+                Button {
+                    openSideStore()
+                    dismissExpiryWarning()
+                } label: {
+                    Label("Open SideStore", systemImage: "arrow.up.forward.app")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button {
+                    dismissExpiryWarning()
+                } label: {
+                    Text("Later")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            .font(.subheadline.weight(.medium))
+        }
+        .padding(22)
+        .frame(maxWidth: 420)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
+    }
+
+    // MARK: - Readiness overlay
+
+    /// Full-screen blocking overlay shown until pairing, tunnel and DDI are all up.
+    /// The scrim is an opaque-to-touches material layer, so it swallows every tap
+    /// that misses the card; the map underneath additionally has hit-testing off.
+    private var readinessOverlay: some View {
+        ZStack {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .ignoresSafeArea()
+
+            readinessCard
+                .padding(.horizontal, 24)
+        }
+        .transition(.opacity)
+    }
+
+    private var readinessCard: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("尚未連接裝置", systemImage: "bolt.horizontal.circle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.orange)
+                Text("飛菇需要先連上這支 iPhone，才能開始模擬定位。")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if isCellularStartGuideActive {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("4G 離線模式進行中", systemImage: "airplane.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.orange)
+                    Text("1. Wi-Fi 關閉，保持 4G 開啟\n2. LocalDevVPN 顯示已連線\n3. 留在 LocalDevVPN 開啟飛航模式\n4. 回到飛菇，等待下方三項完成\n5. 飛航模式先別關，先啟動定位\n6. 綠色提示出現後，才關飛航恢復 4G")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("進入地圖後飛航模式先不要關，必須先成功啟動定位。")
+                        .font(.caption.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12)
+                .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+
+            VStack(alignment: .leading, spacing: 14) {
+                readinessRow(
+                    title: "配對檔案已匯入",
+                    isDone: pairingExists,
+                    guidance: "請先匯入這支 iPhone 的 pairing file。"
+                )
+                readinessRow(
+                    title: "裝置通道已連接",
+                    isDone: tunnel.isConnected,
+                    guidance: "平常請用 Wi-Fi 快速啟動；沒有 Wi-Fi 時用 4G 離線啟動。"
+                )
+                readinessRow(
+                    title: "開發者映像 DDI 已掛載",
+                    isDone: mounting.coolisMounted,
+                    guidance: "正在等待 DDI 準備並掛載。",
+                    showsProgress: mounting.mountingThread != nil
+                )
+            }
+
+            VStack(spacing: 10) {
+                if !pairingExists {
+                    Button {
+                        isShowingPairingFilePicker = true
+                    } label: {
+                        Label("匯入配對檔案", systemImage: "square.and.arrow.down")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
+                // Only useful while the tunnel is down — that is the one failure
+                // this button can actually fix.
+                if !tunnel.isConnected {
+                    Button {
+                        openLocalDevVPN()
+                    } label: {
+                        Label("Wi-Fi 快速啟動", systemImage: "wifi")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button {
+                        isShowingCellularStartGuide = true
+                    } label: {
+                        Label("4G 離線啟動", systemImage: "antenna.radiowaves.left.and.right")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        retryConnection()
+                    } label: {
+                        // "Retry Connection" wrapped onto two lines in this
+                        // half-width slot on a narrow device.
+                        Label("重試", systemImage: "arrow.clockwise")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+
+                    // Settings must stay reachable from here: it holds the target IP
+                    // field and "Redownload DDI", the recovery tools for this screen.
+                    Button {
+                        isShowingSettings = true
+                    } label: {
+                        Label("設定", systemImage: "gearshape.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            .font(.subheadline.weight(.medium))
+        }
+        .padding(22)
+        .frame(maxWidth: 420)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
+    }
+
+    private func readinessRow(
+        title: String,
+        isDone: Bool,
+        guidance: String,
+        showsProgress: Bool = false
+    ) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Group {
+                if isDone {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else if showsProgress {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "circle.dashed")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.body)
+            .frame(width: 22, height: 22)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(isDone ? .secondary : .primary)
+                if !isDone {
+                    Text(guidance)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            isDone
+                ? String(localized: "\(title): done")
+                : String(localized: "\(title): pending")
+        )
+    }
+
+    /// Persistent guidance shown over the map after the setup card disappears.
+    /// The critical Airplane Mode instruction must remain visible until the
+    /// location command itself succeeds; tunnel readiness alone is too early.
+    private var cellularStartMapGuide: some View {
+        VStack {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: cellularLocationSessionStarted ? "checkmark.circle.fill" : "airplane.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(cellularLocationSessionStarted ? .green : .orange)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(cellularLocationSessionStarted ? "定位已建立" : "飛航模式先別關")
+                        .font(.subheadline.weight(.bold))
+                    Text(
+                        cellularLocationSessionStarted
+                            ? "現在可以關閉飛航模式、恢復 4G。使用中請不要從多工畫面滑掉飛菇。"
+                            : "先選座標按模擬定位，或啟動一條路線。成功前不要恢復 4G。"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+
+                Button(cellularLocationSessionStarted ? "完成" : "退出") {
+                    isCellularStartGuideActive = false
+                    cellularLocationSessionStarted = false
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.bordered)
+            }
+            .padding(14)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .shadow(color: .black.opacity(0.16), radius: 10, y: 4)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+
+            Spacer()
+        }
+        .transition(.move(edge: .top).combined(with: .opacity))
+        .zIndex(20)
+    }
+
+    private func openLocalDevVPN() {
+        isCellularStartGuideActive = false
+        cellularLocationSessionStarted = false
+        openFirstResolving(RootViewLinks.localDevVPN)
+    }
+
+    private func openLocalDevVPNForCellularStart() {
+        openFirstResolving(RootViewLinks.localDevVPNCellularStart)
+    }
+
+    private func openSideStore() {
+        openFirstResolving(RootViewLinks.sideStore)
+    }
+
+    /// The readiness overlay can be on screen with a simulation still running —
+    /// `concludeSimulationHasStopped()` puts it there, and so does any tunnel
+    /// failure — so this tap has to assume a resend may be mid-handshake. The
+    /// tunnel start therefore queues behind whatever the location-simulation
+    /// queue is doing rather than racing it for `<targetIP>:49152`; it is
+    /// deferred, never dropped. See `startTunnelAfterPendingLocationCommands`.
+    ///
+    /// The other two are immediate on purpose: they are what makes the tap feel
+    /// answered, and neither touches the device's location-simulation service.
+    private func retryConnection() {
+        markTunnelDisconnected()
+        startTunnelAfterPendingLocationCommands()
+        MountingProgress.shared.checkforMounted()
+    }
+
+    private func importPairingFile(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            do {
+                try PairingFileStore.importFromPicker(url)
+                pairingExists = true
+                markTunnelDisconnected()
+                // Same endpoint contention as Retry above: a pairing file can be
+                // imported from the readiness overlay with a simulation still
+                // running.
+                startTunnelAfterPendingLocationCommands()
+                AlertPresenter.dismissPresentedAlert()
+            } catch {
+                LogManager.shared.addErrorLog("Failed to import pairing file: \(error.localizedDescription)")
+                showAlert(title: String(localized: "Import Failed"), message: error.localizedDescription, showOk: true)
+            }
+        case .failure(let error):
+            LogManager.shared.addErrorLog("Pairing file picker failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - URL scheme (tlocation://)
+
+    private func handleURL(_ url: URL) {
+        guard let host = url.host()?.lowercased() else { return }
+        switch host {
+        case "simulate-location", "set-location", "location", "location-simulation":
+            confirmSimulatedLocation(from: url)
+        case "clear-location", "stop-location":
+            pendingLocationAction = .clear
+        default:
+            break
+        }
+    }
+
+    private func confirmSimulatedLocation(from url: URL) {
+        guard let coordinate = coordinate(from: url) else {
+            showAlert(
+                title: String(localized: "Invalid Location URL"),
+                // A literal URL template: nothing here is translatable.
+                message: "Use tlocation://simulate-location?lat=37.3349&lon=-122.0090",
+                showOk: true
+            )
+            return
+        }
+        guard coordinateIsValid(latitude: coordinate.latitude, longitude: coordinate.longitude) else {
+            showAlert(
+                title: String(localized: "Invalid Coordinates"),
+                message: String(localized: "Latitude must be between -90 and 90. Longitude must be between -180 and 180."),
+                showOk: true
+            )
+            return
+        }
+        pendingLocationAction = .simulate(url, coordinate.latitude, coordinate.longitude)
+    }
+
+    private func performLocationAction(_ action: ExternalLocationAction) {
+        switch action {
+        case .simulate(let url, _, _):
+            requestSimulatedLocation(from: url)
+        case .clear:
+            requestClearSimulatedLocation()
+        }
+    }
+
+    /// Hands the request to `LocationSimulationView`, which is the single owner of the
+    /// simulation state (map pin, 4s resend loop, route playback, background task).
+    /// Calling the FFI here instead would leave that state out of sync: the resend loop
+    /// would revive a cleared position, and a URL-started simulation could not be stopped
+    /// from the map.
+    private func requestSimulatedLocation(from url: URL) {
+        guard let coordinate = coordinate(from: url),
+              coordinateIsValid(latitude: coordinate.latitude, longitude: coordinate.longitude) else {
+            return
+        }
+        guard requirePairingFile(
+            message: String(localized: "Import a pairing file before simulating location from a URL.")
+        ) else { return }
+
+        // No coordinate in the log — see `simulate_location`.
+        LogManager.shared.addInfoLog("Requested simulated location from URL")
+        LocationSimulationRequest.postSimulate(
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude
+        )
+    }
+
+    private func requestClearSimulatedLocation() {
+        guard requirePairingFile(
+            message: String(localized: "Import a pairing file before clearing the simulated location from a URL.")
+        ) else { return }
+
+        LogManager.shared.addInfoLog("Requested clear of simulated location from URL")
+        LocationSimulationRequest.postClear()
+    }
+
+    private func requirePairingFile(message: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: PairingFileStore.prepareURL().path) else {
+            showAlert(title: String(localized: "Pairing File Required"), message: message, showOk: true)
+            return false
+        }
+        return true
+    }
+
+    private func coordinate(from url: URL) -> (latitude: Double, longitude: Double)? {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let queryItems = components?.queryItems ?? []
+
+        func queryValue(_ names: [String]) -> String? {
+            for name in names {
+                if let value = queryItems.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame })?.value {
+                    return value
+                }
+            }
+            return nil
+        }
+
+        if let latitudeText = queryValue(["lat", "latitude"]),
+           let longitudeText = queryValue(["lon", "lng", "long", "longitude"]),
+           let latitude = Double(latitudeText.trimmingCharacters(in: .whitespacesAndNewlines)),
+           let longitude = Double(longitudeText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return (latitude, longitude)
+        }
+
+        let coordinateText = queryValue(["coordinate", "coordinates", "coords", "q", "ll"])
+            ?? components?.path
+            ?? ""
+        let values = numbers(in: coordinateText)
+        guard values.count >= 2 else { return nil }
+        return (values[0], values[1])
+    }
+
+    private func coordinateIsValid(latitude: Double, longitude: Double) -> Bool {
+        (-90.0...90.0).contains(latitude) && (-180.0...180.0).contains(longitude)
+    }
+
+    private func numbers(in text: String) -> [Double] {
+        let pattern = #"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: range).compactMap { match in
+            guard let matchRange = Range(match.range, in: text) else { return nil }
+            return Double(text[matchRange])
+        }
+    }
+}

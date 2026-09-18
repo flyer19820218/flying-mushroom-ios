@@ -1,0 +1,2329 @@
+//
+//  MapSelectionView.swift
+//  TLocation
+//
+//  Created by Stephen on 11/3/25.
+//
+
+import SwiftUI
+import MapKit
+import UIKit
+import Foundation
+
+private struct CoordinateSnapshot: Equatable {
+    let latitude: Double
+    let longitude: Double
+
+    init(_ coordinate: CLLocationCoordinate2D) {
+        latitude = coordinate.latitude
+        longitude = coordinate.longitude
+    }
+
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+}
+
+/// Parses coordinates typed or pasted directly into the search field (e.g.
+/// "21.012452, 105.847002"). File-based import (GPX/KML/GeoJSON/CSV) has been
+/// removed; this inline text path is all that remains and must keep working.
+private enum CoordinateImportParser {
+    private enum CoordinateOrder {
+        case latitudeLongitude
+        case longitudeLatitude
+    }
+
+    static func parseInline(_ text: String) -> [CLLocationCoordinate2D] {
+        sanitized(parseTextCoordinates(from: text))
+    }
+
+    private static func sanitized(_ coordinates: [CLLocationCoordinate2D]) -> [CLLocationCoordinate2D] {
+        var result: [CLLocationCoordinate2D] = []
+        for coordinate in coordinates where CLLocationCoordinate2DIsValid(coordinate) {
+            if result.last.map(CoordinateSnapshot.init) == CoordinateSnapshot(coordinate) {
+                continue
+            }
+            result.append(coordinate)
+        }
+        return result
+    }
+
+    private static func coordinate(
+        first: Double,
+        second: Double,
+        order: CoordinateOrder
+    ) -> CLLocationCoordinate2D? {
+        let preferred: CLLocationCoordinate2D
+        let fallback: CLLocationCoordinate2D
+
+        switch order {
+        case .latitudeLongitude:
+            preferred = CLLocationCoordinate2D(latitude: first, longitude: second)
+            fallback = CLLocationCoordinate2D(latitude: second, longitude: first)
+        case .longitudeLatitude:
+            preferred = CLLocationCoordinate2D(latitude: second, longitude: first)
+            fallback = CLLocationCoordinate2D(latitude: first, longitude: second)
+        }
+
+        if CLLocationCoordinate2DIsValid(preferred) {
+            return preferred
+        }
+        if CLLocationCoordinate2DIsValid(fallback) {
+            return fallback
+        }
+        return nil
+    }
+
+    private static func parseTextCoordinates(from text: String) -> [CLLocationCoordinate2D] {
+        var coordinates: [CLLocationCoordinate2D] = []
+        var headerIndices: (latitude: Int, longitude: Int)?
+
+        for line in text.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            let fields = splitFields(trimmed)
+            if headerIndices == nil,
+               let detectedHeader = detectHeader(in: fields) {
+                headerIndices = detectedHeader
+                continue
+            }
+
+            if let headerIndices,
+               fields.indices.contains(headerIndices.latitude),
+               fields.indices.contains(headerIndices.longitude),
+               let latitude = numbers(in: fields[headerIndices.latitude]).first,
+               let longitude = numbers(in: fields[headerIndices.longitude]).first,
+               let coordinate = coordinate(first: latitude, second: longitude, order: .latitudeLongitude) {
+                coordinates.append(coordinate)
+                continue
+            }
+
+            let values = numbers(in: trimmed)
+            if values.count >= 2,
+               let coordinate = coordinate(first: values[0], second: values[1], order: .latitudeLongitude) {
+                coordinates.append(coordinate)
+            }
+        }
+
+        return coordinates
+    }
+
+    private static func splitFields(_ line: String) -> [String] {
+        line
+            .split { character in
+                character == "," ||
+                character == ";" ||
+                character == "\t"
+            }
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    private static func detectHeader(in fields: [String]) -> (latitude: Int, longitude: Int)? {
+        let lowered = fields.map { $0.lowercased() }
+        guard let latitude = lowered.firstIndex(where: { $0 == "lat" || $0 == "latitude" }),
+              let longitude = lowered.firstIndex(where: { $0 == "lon" || $0 == "lng" || $0 == "long" || $0 == "longitude" }) else {
+            return nil
+        }
+        return (latitude, longitude)
+    }
+
+    private static func numbers(in text: String) -> [Double] {
+        let pattern = #"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: range).compactMap { match in
+            guard let matchRange = Range(match.range, in: text) else { return nil }
+            return Double(text[matchRange])
+        }
+    }
+}
+
+// `LocationBookmark` and its persistence now live in Support/BookmarkStore.swift,
+// so Settings can export and import the same list this view edits.
+
+// MARK: - Search Completer
+
+@MainActor
+final class LocationSearchCompleter: NSObject, ObservableObject, MKLocalSearchCompleterDelegate {
+    @Published var results: [MKLocalSearchCompletion] = []
+    private let completer = MKLocalSearchCompleter()
+
+    override init() {
+        super.init()
+        completer.delegate = self
+        completer.resultTypes = [.address, .pointOfInterest]
+    }
+
+    func update(query: String) {
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            results = []
+            completer.queryFragment = ""
+            return
+        }
+        completer.queryFragment = query
+    }
+
+    /// Biases suggestions toward what is currently on screen, so a common place
+    /// name resolves near the visible map instead of the nearest match anywhere.
+    func update(region: MKCoordinateRegion) {
+        completer.region = region
+    }
+
+    nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
+        let results = completer.results
+        Task { @MainActor in self.results = results }
+    }
+
+    nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
+        Task { @MainActor in self.results = [] }
+    }
+}
+
+/// Circular glass/material backing for the floating map buttons. Uses iOS 26's
+/// Liquid Glass when available and falls back to `.ultraThinMaterial` on iOS 17.4+.
+private struct FloatingCircleBackground: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            content
+                .glassEffect(in: .circle)
+        } else {
+            content
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(Color.primary.opacity(0.08)))
+                .shadow(color: .black.opacity(0.15), radius: 6, y: 3)
+        }
+    }
+}
+
+/// Rounded glass/material backing for the pin callout. Same iOS 26 Liquid Glass
+/// / `.ultraThinMaterial` split as `FloatingCircleBackground`, so the callout
+/// stays legible over both light map tiles and dark satellite imagery.
+private struct CalloutBackground: ViewModifier {
+    private static let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            content
+                .glassEffect(in: .rect(cornerRadius: 14))
+        } else {
+            content
+                .background(.ultraThinMaterial, in: Self.shape)
+                .overlay(Self.shape.strokeBorder(Color.primary.opacity(0.10)))
+                .shadow(color: .black.opacity(0.20), radius: 6, y: 3)
+        }
+    }
+}
+
+/// Enlarges a tappable chip's *hit region* vertically toward Apple's ~44pt
+/// touch-target minimum, without touching its horizontal footprint: only
+/// `.padding(.vertical:)` is applied, so `HStack` layout — and therefore the
+/// callout's rendered width — is completely unaffected. The chip's own
+/// background/overlay stay at their original `26pt` size; `.contentShape` is
+/// what makes the padded, invisible vertical margin respond to taps.
+///
+/// A prior version of this modifier also padded horizontally to reach a full
+/// 44×44 box, but that grew each chip's reported width and forced the
+/// callout wider (240 → 276pt) to fit — visibly larger than before, which
+/// was rejected. Horizontal hit area is intentionally left alone: the Copy
+/// chip sits between the coordinate text and the Save chip with only `8pt`
+/// of `HStack` spacing on each side, so any horizontal padding here would
+/// either widen the callout (if it grows the reported frame, as `.padding`
+/// does) or risk the two chips' hit regions no longer being disjoint.
+/// Vertical padding has no such conflict — there is no sibling above or
+/// below a chip to collide with — so it is free real estate for tap comfort.
+///
+/// `26pt` visible chip (`LocationSimulationView.calloutChipSize`) + `9pt`
+/// padding per side = `44pt` tall reported frame, `26pt` wide (unchanged).
+///
+/// Only ever applied to interactive chips (Copy, unsaved Save). The saved
+/// badge is not a button and must not pick this up, or it would gain a
+/// tappable footprint it should never have.
+private struct CalloutTapTarget: ViewModifier {
+    static let verticalPadding: CGFloat = 9
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.vertical, Self.verticalPadding)
+            .contentShape(Rectangle())
+    }
+}
+
+/// Which alert `LocationSimulationView` currently wants on screen.
+///
+/// SwiftUI only reliably honours one `.alert` per view at the same
+/// modifier-chain level. Three stacked `.alert`s made presentation
+/// non-deterministic and let a `Bool` binding desync into a stuck `true`: the
+/// Save-bookmark chip set `showSaveBookmarkAlert = true` while it was *already*
+/// `true` with nothing on screen, which is a no-op, so tapping did nothing at
+/// all until the app was relaunched. Routing all three through one piece of
+/// optional state and one `.alert` modifier removes the class of bug — exactly
+/// the consolidation `PendingImport` in `SettingsView` applies to
+/// `.fileImporter`. Adding a fourth alert means a fourth case here, not a
+/// second `.alert`.
+///
+/// The generic message case carries its own title and body, so there is no
+/// separate `alertTitle` / `alertMessage` state left over to drift out of step
+/// with what is actually being presented.
+private enum PendingAlert {
+    /// Generic error/information alert with a runtime-supplied, already
+    /// localized title and body.
+    case message(title: String, body: String)
+    case saveBookmark
+    case locationPermissionDenied
+
+    /// Verbatim, because the `.message` payload arrives already localized from
+    /// `String(localized:)` at the call site; the two fixed cases look their own
+    /// titles up here so the rest of the view never has to.
+    var title: String {
+        switch self {
+        case .message(let title, _): return title
+        case .saveBookmark: return String(localized: "Save Bookmark")
+        case .locationPermissionDenied: return String(localized: "Location Permission Needed")
+        }
+    }
+}
+
+/// Which sheet `LocationSimulationView` currently wants on screen. Same reason
+/// as `PendingAlert`: two stacked `.sheet` modifiers carry the same
+/// presentation-conflict risk, so Bookmarks and Settings share one piece of
+/// state and one `.sheet(item:)` — which nils the item itself on every
+/// dismissal, leaving nothing to get stuck.
+private enum PendingSheet: Identifiable {
+    case bookmarks
+    case settings
+    case tool(MobileTool)
+
+    var id: String {
+        switch self {
+        case .bookmarks: return "bookmarks"
+        case .settings: return "settings"
+        case .tool(let tool): return "tool-\(tool.id)"
+        }
+    }
+}
+
+/// Which run of the resend loop a tick belongs to.
+///
+/// Invalidating the `Timer` stops *future* ticks; it does nothing about ticks
+/// already handed to the serial `LocationSimulationCommandQueue`. Those are not
+/// rare or fleeting: a failing `simulate_location` tears the dead session down
+/// and builds a fresh tunnel, remote server and session before it returns, with
+/// no timeout of its own, so ticks routinely outlast the four-second period and
+/// pile up behind each other. By the time three failures have been counted on
+/// the main thread and the app has told the user the simulation is over, several
+/// more ticks can still be queued.
+///
+/// One of those succeeding would put the device back to simulating a position
+/// the app has just declared dead and disarmed Stop for: no way to clear it, and
+/// `LocationSimulationSession` left claiming an open session with nothing
+/// watching it. So each tick captures the generation it was scheduled under and
+/// re-checks it *on the queue, immediately before the FFI call* — the last
+/// moment before anything reaches the device.
+///
+/// **The verdict that ends a run is reached on the command queue, not on the
+/// main thread.** Counting the failure streak on the main thread left a hole one
+/// tick wide: tick A's queue block got its code, handed it to
+/// `DispatchQueue.main.async`, and returned; the serial queue immediately
+/// started tick B, whose generation check ran *before* the main thread had
+/// processed the third failure and retired the run — so a tick B that then
+/// succeeded resurrected the simulation the app was in the middle of declaring
+/// dead. `record(code:for:limit:)` therefore tallies the streak and bumps the
+/// generation itself, under the same lock, from inside the tick's own block. The
+/// serial queue cannot start the next block until that has returned, so once the
+/// app has decided a run is over there is no position left in the queue from
+/// which a tick can still reach `simulate_location`. The main thread only
+/// applies the verdict (log, state, alert); it no longer decides it.
+///
+/// `stopResendLoop()` still bumps the counter, which retires every tick already
+/// in flight in one move — that is what covers Stop, Return to Real Location, a
+/// Shortcut's clear, the map going off screen and a re-simulate onto a new
+/// anchor, none of which pass through a tick at all.
+///
+/// Process-wide rather than view state, deliberately: the thing it guards (the
+/// session inside `LocationSimulationState`) is process-wide too, and it is read
+/// from `LocationSimulationCommandQueue`, where SwiftUI `@State` has no business
+/// being touched.
+private enum ResendGeneration {
+    private static let lock = NSLock()
+    private static var value: UInt64 = 0
+    /// Consecutive non-zero resend codes within the *current* generation. Reset
+    /// by every retirement, so it can only ever describe one unbroken run.
+    private static var failureStreak = 0
+
+    /// What one tick's return code means for the run it belongs to. Decided on
+    /// `LocationSimulationCommandQueue`; the main thread only applies it.
+    enum Outcome {
+        /// The tick belonged to a run that had already been retired. Nothing to
+        /// apply.
+        case stale
+        /// The device accepted the coordinate; the streak is back to zero.
+        case succeeded
+        /// A failure, but not the one that ends the run.
+        case failed(streak: Int)
+        /// The failure that ends the run. The run was retired *before this case
+        /// was returned* — on the command queue, inside the tick's own block —
+        /// so no later tick can reach the FFI. `successor` is the generation
+        /// that retirement produced: the main thread checks it is still current
+        /// before acting on the verdict, so a Stop or a fresh simulation that
+        /// lands in between wins and this verdict is dropped.
+        case concluded(streak: Int, successor: UInt64)
+    }
+
+    /// Retires every tick scheduled under the current generation and returns the
+    /// new one for the run that is starting (callers that are only stopping can
+    /// ignore it).
+    @discardableResult
+    static func invalidate() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return retireLocked()
+    }
+
+    static func isCurrent(_ generation: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value == generation
+    }
+
+    /// Records one tick's outcome. **Call from `LocationSimulationCommandQueue`,
+    /// in the same block as the FFI call whose code this is**, so that a run
+    /// ending here is retired before the queue can start the next tick.
+    static func record(code: Int32, for generation: UInt64, limit: Int) -> Outcome {
+        lock.lock()
+        defer { lock.unlock() }
+        guard value == generation else { return .stale }
+
+        guard code != 0 else {
+            failureStreak = 0
+            return .succeeded
+        }
+
+        failureStreak += 1
+        guard failureStreak >= limit else { return .failed(streak: failureStreak) }
+
+        let streak = failureStreak
+        return .concluded(streak: streak, successor: retireLocked())
+    }
+
+    /// The single bump. Callers hold `lock`; `invalidate()` must not be called
+    /// from `record(code:for:limit:)`, which already holds it (`NSLock` is not
+    /// recursive). Nothing here dispatches, synchronously or otherwise, so a
+    /// caller already running on `LocationSimulationCommandQueue` cannot
+    /// deadlock against it.
+    private static func retireLocked() -> UInt64 {
+        // Wrapping is fine and unreachable in practice: at one bump per
+        // start/stop, exhausting 2^64 would take longer than the device exists.
+        value &+= 1
+        failureStreak = 0
+        return value
+    }
+}
+
+/// Retires movement ticks that were already queued when a route is paused,
+/// stopped, replaced, or reaches its destination.
+private enum RoutePlaybackGeneration {
+    private static let lock = NSLock()
+    private static var value: UInt64 = 0
+
+    @discardableResult
+    static func invalidate() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        value &+= 1
+        return value
+    }
+
+    static func isCurrent(_ candidate: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value == candidate
+    }
+}
+
+struct LocationSimulationView: View {
+    /// Opt-in "natural GPS drift": when enabled, periodic resends of an active
+    /// simulation wobble a few metres around the chosen point instead of
+    /// resending the exact same fix every time. Off by default; see
+    /// `jitteredCoordinate(around:)` and `startResendLoop(with:)`.
+    @AppStorage("naturalGPSDrift") private var naturalGPSDrift = false
+
+    @State private var coordinate: CLLocationCoordinate2D?
+    @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
+    /// Last zoom span reported by the map camera, so recentring never rescales.
+    /// `nil` until the map has reported a region at least once.
+    @State private var cameraSpan: MKCoordinateSpan?
+
+    @State private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    @State private var resendTimer: Timer?
+    @State private var routeTimer: Timer?
+    @State private var routeCoordinates: [CLLocationCoordinate2D] = []
+    @State private var routeIndex = 0
+    @State private var routeName = ""
+    @State private var routeSpeedKPH = 19.0
+    @State private var isRoutePaused = false
+    @State private var routeTickInFlight = false
+    @State private var routeGeneration: UInt64 = 0
+    @AppStorage("routeNotifyAt99Percent") private var routeNotifyAt99Percent = true
+    @State private var routeNotificationSent = false
+    /// V2 transport recovery: a network transition must not destroy a route.
+    /// The current index is kept and the same coordinate is retried until the
+    /// LocalDevVPN/RSD path returns; the user can always end it with Restore.
+    @State private var routeReconnectAttempts = 0
+    @State private var isBusy = false
+    /// Drives the single consolidated `.alert` below — see `PendingAlert`.
+    /// Nothing else in this view decides whether an alert is on screen.
+    @State private var pendingAlert: PendingAlert?
+    /// One alert deep of waiting room for `presentAlert(_:)`, so an unsolicited
+    /// alert raised while another is already up is shown after it rather than
+    /// dropped on the floor. Still exactly one `.alert` modifier and one
+    /// "what is on screen" variable — see `presentAlert(_:)`.
+    @State private var deferredAlert: PendingAlert?
+
+    @State private var searchText = ""
+    @StateObject private var searchCompleter = LocationSearchCompleter()
+    @FocusState private var isSearchFocused: Bool
+    @State private var simulatedCoordinate: CLLocationCoordinate2D?
+
+    // Bookmarks
+    @State private var bookmarks: [LocationBookmark] = []
+    /// Drives the single consolidated `.sheet` below — see `PendingSheet`.
+    @State private var pendingSheet: PendingSheet?
+    /// Draft name typed into the "Save Bookmark" alert (`PendingAlert
+    /// .saveBookmark`, opened from the callout's unsaved bookmark chip).
+    /// `beginSaveBookmark` blanks it every time it opens the alert, so the user
+    /// always types into an empty field rather than one pre-filled with the
+    /// coordinate default; that default is only ever used as a fallback if Save
+    /// is tapped while the field is still empty (see
+    /// `saveCurrentPinAsBookmark`). It is cleared again on the way out too — by
+    /// `saveCurrentPinAsBookmark` on Save, by `cancelSaveBookmark` on Cancel —
+    /// but the clear on the way *in* is what actually guarantees no leftover
+    /// text from a previous pin can ever be shown.
+    ///
+    /// Deliberately not cleared from the alert's `isPresented` setter: SwiftUI
+    /// flips that binding as part of dismissing the alert, which can happen
+    /// before the tapped button's action runs, and wiping the name there would
+    /// make Save silently store the coordinate fallback instead of what was
+    /// typed.
+    @State private var newBookmarkName = ""
+
+    /// Measured size of the pin callout, used to work out the screen rectangle
+    /// the annotation occupies so a tap that lands on it is not also treated as
+    /// a map tap. Zero until the callout has been laid out once.
+    @State private var calloutSize: CGSize = .zero
+
+    // Current location
+    @StateObject private var currentLocationProvider = CurrentLocationProvider()
+    /// Guards the one-shot launch centring below so it runs once per app
+    /// launch, not every time this view's `.onAppear` fires (e.g. after the
+    /// Settings sheet, presented from this same view, is dismissed).
+    @State private var hasCenteredOnLaunch = false
+    /// Comfortable street/neighbourhood-level zoom for the initial launch
+    /// centring. Tune here if it ever needs to change.
+    private static let defaultSpanMeters: CLLocationDistance = 800
+
+    /// True from the moment "Return to Real Location" is tapped until the
+    /// `clear()` FFI call finishes, so the button can show a spinner across
+    /// that single async hop.
+    @State private var isReturningToRealLocation = false
+    /// The clear command succeeded, but Core Location has not yet delivered a
+    /// fix that it identifies as real rather than software-simulated.
+    @State private var isAwaitingRealLocation = false
+
+    /// Brief, non-modal confirmation shown in the bottom control area (e.g.
+    /// after "Return to Real Location"). Auto-clears itself a few seconds
+    /// after being set; see `showStatusMessage`.
+    @State private var statusMessage: String?
+    @State private var statusMessageWorkItem: DispatchWorkItem?
+    private static let statusMessageDuration: TimeInterval = 3.0
+
+    /// How many resends in a row have come back non-zero. Reset to zero by any
+    /// successful resend and by `startResendLoop`/`stopResendLoop`, so it only
+    /// ever counts an unbroken run. Main-thread only, like every other piece of
+    /// this view's state — see `handleResendResult(_:)`.
+    @State private var consecutiveResendFailures = 0
+
+    /// Consecutive failed resends before the app concludes the simulation is no
+    /// longer running and says so.
+    ///
+    /// Three — three *failures*, not three ticks and not a fixed span of time.
+    /// The loop fires every four seconds, but a failing `simulate_location` does
+    /// a full untimed tunnel rebuild before it reports back, so a single failing
+    /// tick can take far longer than the period; the timer keeps firing
+    /// meanwhile and the extra ticks queue up behind it on the serial command
+    /// queue (they are retired by `ResendGeneration` once the run ends). A
+    /// healthy loop reaches this verdict in about twelve seconds; a loop failing
+    /// on slow, hanging rebuilds can take considerably longer, and that is the
+    /// intended trade — the app waits for three rebuild attempts to actually
+    /// come back refused rather than guessing from a clock.
+    ///
+    /// One failure is far too eager to act on: every failing tick already
+    /// contains a complete recovery attempt of its own — `simulate_location`
+    /// tears the dead session down and builds a fresh tunnel, remote server and
+    /// session at the user's anchor before it reports failure — so a single
+    /// non-zero code can be a transport blip mid-repair (VPN re-establishing
+    /// after a foreground return, Wi-Fi roaming) rather than a verdict. Three
+    /// consecutive failures means three full rebuild attempts have been made and
+    /// refused, which is well past any of those, while still telling the user the
+    /// truth promptly rather than leaving the map lying indefinitely.
+    private static let resendFailureLimit = 3
+
+    private var pairingFilePath: String {
+        PairingFileStore.prepareURL().path
+    }
+
+    private var pairingExists: Bool {
+        FileManager.default.fileExists(atPath: pairingFilePath)
+    }
+
+    private var deviceIP: String {
+        DeviceConnectionContext.targetIPAddress
+    }
+
+    private var hasActiveSimulation: Bool {
+        simulatedCoordinate != nil
+    }
+
+    private var hasActiveRoute: Bool {
+        !routeCoordinates.isEmpty
+    }
+
+    private var activeMobileTool: MobileTool? {
+        guard case .tool(let tool)? = pendingSheet else { return nil }
+        return tool
+    }
+
+    private var searchResultsListBase: some View {
+        List(searchCompleter.results.prefix(5), id: \.self) { result in
+            Button {
+                selectSearchResult(result)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(result.title)
+                        .font(.subheadline)
+                    if !result.subtitle.isEmpty {
+                        Text(result.subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .listStyle(.plain)
+        .frame(maxHeight: 350)
+        .scrollDisabled(true)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+    }
+
+    @ViewBuilder
+    private var searchResultsList: some View {
+        if #available(iOS 26, *) {
+            searchResultsListBase
+                .glassEffect(in: .rect(cornerRadius: 12))
+        } else {
+            searchResultsListBase
+        }
+    }
+
+    // MARK: - Floating map controls
+
+    /// Everything that used to live in the navigation bar, drawn as Apple-Maps
+    /// style floating overlays: full-width search capsule on top, completion list
+    /// under it, and a right-hand column of circular action buttons.
+    private var mapOverlayControls: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                floatingSearchField
+
+                if isSearchFocused || !searchText.isEmpty {
+                    Button("Cancel") {
+                        dismissSearch()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tint)
+                    .accessibilityLabel("Cancel Search")
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+            }
+            .padding(.horizontal, 16)
+            .animation(.default, value: isSearchFocused || !searchText.isEmpty)
+
+            if !searchCompleter.results.isEmpty {
+                searchResultsList
+            }
+
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                floatingControlColumn
+            }
+            .padding(.horizontal, 16)
+        }
+        .padding(.top, 10)
+    }
+
+    /// Clears the search field, drops any pending completions, and resigns
+    /// keyboard focus. Used by both the Cancel button and map-tap dismissal.
+    private func dismissSearch() {
+        searchText = ""
+        searchCompleter.results = []
+        isSearchFocused = false
+    }
+
+    private var floatingSearchFieldBase: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            TextField("Search location...", text: $searchText)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .submitLabel(.go)
+                .focused($isSearchFocused)
+                .onChange(of: searchText) { _, newValue in
+                    searchCompleter.update(query: newValue)
+                }
+                .onSubmit {
+                    applyCoordinatesFromSearchText()
+                    isSearchFocused = false
+                }
+
+            if !searchText.isEmpty {
+                Button {
+                    // Clears the typed text only; focus is left alone so the
+                    // user can keep typing. Cancel (above) is the control that
+                    // also drops focus and dismisses the keyboard.
+                    searchText = ""
+                    searchCompleter.results = []
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear Search")
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 48)
+    }
+
+    @ViewBuilder
+    private var floatingSearchField: some View {
+        if #available(iOS 26, *) {
+            floatingSearchFieldBase
+                .glassEffect(in: .capsule)
+        } else {
+            floatingSearchFieldBase
+                .background(.ultraThinMaterial, in: Capsule())
+                .shadow(color: .black.opacity(0.15), radius: 8, y: 3)
+        }
+    }
+
+    private var floatingControlColumn: some View {
+        VStack(spacing: 10) {
+            mapControlButton(
+                systemImage: "location.fill",
+                accessibilityLabel: "Locate Me",
+                isDisabled: isBusy || currentLocationProvider.isLocating || isReturningToRealLocation,
+                showsProgress: currentLocationProvider.isLocating && !isReturningToRealLocation,
+                action: performLocate
+            )
+
+            mapControlButton(
+                systemImage: "location.slash.fill",
+                accessibilityLabel: "Return to Real Location",
+                // The device can still be on a simulated fix after TLocation
+                // itself is relaunched, when `hasActiveSimulation` has reset.
+                // Clearing must therefore never depend on in-memory UI state.
+                isDisabled: isBusy || currentLocationProvider.isLocating || isReturningToRealLocation || !pairingExists,
+                showsProgress: isReturningToRealLocation,
+                action: returnToRealLocation
+            )
+
+            mapControlButton(
+                systemImage: "bookmark.fill",
+                accessibilityLabel: "Bookmarks",
+                isDisabled: false,
+                action: { pendingSheet = .bookmarks }
+            )
+
+            // Settings stays a first-class button: it is the fallback route to
+            // importing a pairing file when the connection banner is dismissed.
+            mapControlButton(
+                systemImage: "gearshape.fill",
+                accessibilityLabel: "Settings",
+                isDisabled: false,
+                action: { pendingSheet = .settings }
+            )
+        }
+    }
+
+    private func mapControlButton(
+        systemImage: String,
+        accessibilityLabel: LocalizedStringKey,
+        isDisabled: Bool,
+        showsProgress: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Group {
+                if showsProgress {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 17, weight: .semibold))
+                }
+            }
+            .frame(width: 48, height: 48)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.tint)
+        .modifier(FloatingCircleBackground())
+        .opacity(isDisabled ? 0.4 : 1)
+        .disabled(isDisabled)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// Bottom cluster (Stop / Simulate Location, plus any transient status
+    /// message). Given a material backing so it stays legible on a map.
+    private var bottomControlCluster: some View {
+        VStack(spacing: 12) {
+            if hasActiveRoute {
+                routePlaybackControls
+            } else {
+                pinControls
+            }
+
+            returnToRealLocationButton
+
+            MobileToolDock(selectedTool: activeMobileTool) { tool in
+                if let tool {
+                    pendingSheet = .tool(tool)
+                } else {
+                    pendingSheet = nil
+                }
+            }
+        }
+        .animation(.default, value: statusMessage)
+        .padding(.vertical, 14)
+        .padding(.horizontal, 20)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
+    }
+
+    private var routePlaybackControls: some View {
+        VStack(spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(routeName.isEmpty ? "路線播放" : routeName)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Text("\(routeIndex) / \(routeCoordinates.count) · \(routeSpeedKPH, specifier: "%.1f") km/h")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                ProgressView(
+                    value: Double(routeIndex),
+                    total: Double(max(routeCoordinates.count, 1))
+                )
+                .frame(width: 82)
+            }
+
+            if routeReconnectAttempts > 0 {
+                Label(
+                    "定位通道中斷，保留斷點並重連中（第 \(routeReconnectAttempts) 次）",
+                    systemImage: "arrow.triangle.2.circlepath"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Toggle(isOn: $routeNotifyAt99Percent) {
+                Label("99% 時通知", systemImage: "bell.fill")
+                    .font(.caption.weight(.semibold))
+            }
+            .toggleStyle(.switch)
+
+            Button {
+                toggleRoutePause()
+            } label: {
+                Label(isRoutePaused ? "繼續" : "暫停", systemImage: isRoutePaused ? "play.fill" : "pause.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+    }
+
+    private var returnToRealLocationButton: some View {
+        Button(role: .destructive) {
+            returnToRealLocation()
+        } label: {
+            HStack {
+                if isReturningToRealLocation {
+                    ProgressView().tint(.white)
+                }
+                Label(
+                    isReturningToRealLocation ? "正在恢復真實定位…" : "恢復真實定位",
+                    systemImage: "location.slash.fill"
+                )
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.red)
+        .disabled(!pairingExists || isBusy || currentLocationProvider.isLocating || isReturningToRealLocation)
+    }
+
+    // MARK: - Pin callout
+
+    /// Gap between the callout and the pin glyph below it.
+    private static let calloutSpacing: CGFloat = 4
+    /// Height of `pinGlyph` (head + stem). Fixed, so the annotation's screen
+    /// rectangle can be reconstructed in `isInsidePinAnnotation`.
+    private static let pinGlyphHeight: CGFloat = 30
+    private static let pinGlyphWidth: CGFloat = 20
+    /// Keeps a long bookmark name from stretching the callout across the map.
+    /// A `276pt` variant briefly existed to fit chips that had grown wide
+    /// enough to need a 44×44 hit box, but that made the callout visibly
+    /// larger overall and was reverted — `CalloutTapTarget` now only expands
+    /// hit regions vertically, so the chips' reported width (and therefore
+    /// this cap) is back to its original value.
+    private static let calloutMaxWidth: CGFloat = 240
+
+    /// Saved state: a solid, saturated blue chip with a white glyph.
+    private static let bookmarkSavedTint = Color(red: 0.04, green: 0.28, blue: 0.78)
+    /// Unsaved state: a pale, muted blue outline. The difference between the two
+    /// is a filled dark chip vs. an empty light one, which reads at a glance
+    /// without relying on hue alone.
+    private static let bookmarkUnsavedTint = Color(red: 0.42, green: 0.64, blue: 0.92)
+
+    private static func formattedCoordinate(_ coordinate: CLLocationCoordinate2D) -> String {
+        String(format: "%.6f, %.6f", coordinate.latitude, coordinate.longitude)
+    }
+
+    /// The bookmark already saved at the dropped pin, if any.
+    ///
+    /// `coordinate` always holds the exact point the user chose — a map tap, a
+    /// search result, a bookmark, or a `Locate Me` fix. The natural-GPS-drift
+    /// offset from `jitteredCoordinate(around:)` is applied only to the value
+    /// handed to the FFI inside `startResendLoop(with:)` and is never written
+    /// back into `coordinate` or `simulatedCoordinate`, so nothing read here is
+    /// ever a jittered value.
+    private var savedBookmarkAtPin: LocationBookmark? {
+        guard let coordinate else { return nil }
+        return BookmarkStore.bookmark(nearest: coordinate, in: bookmarks)
+    }
+
+    /// Compact information callout drawn above the pin: the bookmark name when
+    /// this place is already saved, the coordinates, a copy button, and the
+    /// bookmark state/action chip.
+    private func pinCallout(for coordinate: CLLocationCoordinate2D) -> some View {
+        let saved = savedBookmarkAtPin
+
+        return VStack(alignment: .leading, spacing: 3) {
+            if let saved {
+                Text(saved.name)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            // Original `8pt` gap, unchanged. `CalloutTapTarget`'s vertical-only
+            // padding never touches horizontal layout, so this spacing is the
+            // only thing separating the two chips' hit regions horizontally —
+            // and it does, since neither chip's tap target extends sideways.
+            HStack(spacing: 8) {
+                Text(Self.formattedCoordinate(coordinate))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+
+                Button {
+                    copyCoordinates(coordinate)
+                } label: {
+                    calloutChip(
+                        systemImage: "doc.on.doc",
+                        glyphColor: .secondary,
+                        fill: Color.primary.opacity(0.10),
+                        stroke: Color.primary.opacity(0.12)
+                    )
+                    .modifier(CalloutTapTarget())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Copy Coordinates")
+
+                bookmarkChip(saved: saved != nil)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: Self.calloutMaxWidth, alignment: .leading)
+        .modifier(CalloutBackground())
+        // Measured rather than assumed: the height depends on whether the name
+        // line is present and on the user's Dynamic Type size.
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    // `.task(id:)` rather than a direct assignment, so the state
+                    // write happens after layout instead of during it.
+                    .task(id: geometry.size) { calloutSize = geometry.size }
+            }
+        }
+    }
+
+    /// Saved → an inert badge (no button, so it cannot possibly add a second
+    /// bookmark for a place the callout is already naming). Unsaved → a button
+    /// that opens the "Save Bookmark" name prompt (`beginSaveBookmark`).
+    @ViewBuilder
+    private func bookmarkChip(saved: Bool) -> some View {
+        if saved {
+            calloutChip(
+                systemImage: "bookmark.fill",
+                glyphColor: .white,
+                fill: Self.bookmarkSavedTint,
+                stroke: Color.white.opacity(0.65)
+            )
+            .accessibilityLabel("Saved to Bookmarks")
+        } else {
+            Button {
+                beginSaveBookmark()
+            } label: {
+                calloutChip(
+                    systemImage: "bookmark",
+                    glyphColor: Self.bookmarkUnsavedTint,
+                    fill: Self.bookmarkUnsavedTint.opacity(0.20),
+                    stroke: Self.bookmarkUnsavedTint.opacity(0.70)
+                )
+                .modifier(CalloutTapTarget())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Save Bookmark")
+        }
+    }
+
+    /// Visible diameter of a callout chip. Briefly grew to `30pt` alongside a
+    /// horizontally-padded `CalloutTapTarget`, but that made the callout
+    /// visibly larger overall and was reverted back to its original size.
+    private static let calloutChipSize: CGFloat = 26
+
+    private func calloutChip(
+        systemImage: String,
+        glyphColor: Color,
+        fill: Color,
+        stroke: Color
+    ) -> some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(glyphColor)
+            .frame(width: Self.calloutChipSize, height: Self.calloutChipSize)
+            .background(Circle().fill(fill))
+            .overlay(Circle().strokeBorder(stroke, lineWidth: 1))
+            .contentShape(Circle())
+    }
+
+    /// Classic pin: a red head with a white ring over a short stem whose tip is
+    /// the annotation's anchor point. Kept simple and high-contrast so it stays
+    /// readable on satellite imagery.
+    private var pinGlyph: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                Circle().fill(Color.red)
+                Circle().strokeBorder(.white, lineWidth: 2)
+            }
+            .frame(width: Self.pinGlyphWidth, height: Self.pinGlyphWidth)
+
+            Rectangle()
+                .fill(Color.red)
+                .frame(width: 3, height: Self.pinGlyphHeight - Self.pinGlyphWidth)
+        }
+        .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+        .accessibilityHidden(true)
+    }
+
+    /// Whether `point` (map-local coordinates) falls inside the annotation —
+    /// callout plus pin — currently drawn for `coordinate`.
+    ///
+    /// `calloutSize` is measured off the live view hierarchy (see the
+    /// `GeometryReader` in `pinCallout`), so this guard automatically follows
+    /// whatever the callout actually renders at — including the slightly
+    /// taller footprint `CalloutTapTarget`'s vertical hit padding produces —
+    /// with no separate constant to keep in sync by hand.
+    private func isInsidePinAnnotation(_ point: CGPoint, proxy: MapProxy) -> Bool {
+        guard let coordinate,
+              calloutSize != .zero,
+              let anchor = proxy.convert(coordinate, to: .local) else { return false }
+        let width = max(calloutSize.width, Self.pinGlyphWidth)
+        let height = calloutSize.height + Self.calloutSpacing + Self.pinGlyphHeight
+        // `.bottom` anchoring puts the content's bottom edge on the coordinate.
+        let frame = CGRect(x: anchor.x - width / 2, y: anchor.y - height, width: width, height: height)
+        return frame.insetBy(dx: -4, dy: -4).contains(point)
+    }
+
+    private func copyCoordinates(_ coordinate: CLLocationCoordinate2D) {
+        UIPasteboard.general.string = Self.formattedCoordinate(coordinate)
+        Haptics.light()
+        showStatusMessage(String(localized: "Coordinates copied"))
+    }
+
+    /// The coordinate-derived name used as the fallback when the user leaves
+    /// the field empty (or whitespace-only) and hits Save anyway — the same
+    /// default the rest of the app already falls back to (see
+    /// `BookmarksView.commitRename`), so a bookmark always ends up with a name.
+    private static func defaultBookmarkName(for coordinate: CLLocationCoordinate2D) -> String {
+        String(format: "%.4f, %.4f", coordinate.latitude, coordinate.longitude)
+    }
+
+    /// Opens the "Save Bookmark" name prompt with an empty field — the user
+    /// types a name from scratch; the "Name" placeholder keeps the field from
+    /// reading as a blank box. The coordinate-derived default only appears if
+    /// Save is tapped while still empty (see `saveCurrentPinAsBookmark`).
+    /// Mirrors the duplicate guard in `saveCurrentPinAsBookmark` so the chip
+    /// can never be re-tapped into opening the prompt for an already-saved pin.
+    private func beginSaveBookmark() {
+        guard let coord = coordinate,
+              BookmarkStore.bookmark(nearest: coord, in: bookmarks) == nil else { return }
+        newBookmarkName = ""
+        // Assignment, not a flag flip: `pendingAlert` is nil whenever no alert
+        // is on screen (the `.alert` binding's setter guarantees it), so this
+        // can never be the "set true while already true" no-op that used to
+        // leave the chip dead until the app was relaunched.
+        pendingAlert = .saveBookmark
+    }
+
+    /// Cancels the "Save Bookmark" prompt without saving anything, clearing the
+    /// draft name so nothing is left behind. Dismissing the alert itself is the
+    /// `.alert` binding's job, not this function's.
+    private func cancelSaveBookmark() {
+        newBookmarkName = ""
+    }
+
+    /// Commits the "Save Bookmark" prompt: trims the typed name and, if that
+    /// leaves nothing (the field started empty and the user saved without
+    /// typing, or typed only whitespace), falls back to the coordinate-derived
+    /// default — the same behaviour `BookmarksView.commitRename` already uses
+    /// for an emptied rename — so a bookmark always ends up with a name.
+    ///
+    /// Always stores `coordinate`, the exact anchor the user chose; natural GPS
+    /// drift never touches it (see `savedBookmarkAtPin`). The duplicate guard
+    /// repeats the callout's own check, so even if the badge were somehow tapped
+    /// while showing "saved" no second bookmark could be created.
+    private func saveCurrentPinAsBookmark() {
+        defer { newBookmarkName = "" }
+        guard let coord = coordinate,
+              BookmarkStore.bookmark(nearest: coord, in: bookmarks) == nil else { return }
+        let trimmed = newBookmarkName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = trimmed.isEmpty ? Self.defaultBookmarkName(for: coord) : trimmed
+        bookmarks.append(
+            LocationBookmark(
+                name: name,
+                latitude: coord.latitude,
+                longitude: coord.longitude
+            )
+        )
+        saveBookmarks()
+        Haptics.light()
+        showStatusMessage(String(localized: "Saved to Bookmarks"))
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            MapReader { proxy in
+                Map(position: $position) {
+                    // Standard blue dot for the device's own position, so the
+                    // user can tell themselves apart from the red simulation
+                    // pin. Only draws once location permission is granted.
+                    UserAnnotation()
+
+                    if let coordinate {
+                        // `Annotation` rather than `Marker` so the information
+                        // callout is anchored to the coordinate and pans and
+                        // zooms with the map. `.bottom` puts the bottom of the
+                        // content — the tip of the pin stem — on the exact
+                        // point, leaving the callout above it.
+                        Annotation("Pin", coordinate: coordinate, anchor: .bottom) {
+                            VStack(spacing: Self.calloutSpacing) {
+                                pinCallout(for: coordinate)
+                                pinGlyph
+                            }
+                        }
+                        .annotationTitles(.hidden)
+                    }
+                }
+                .mapStyle(.standard(elevation: .realistic))
+                .onTapGesture { point in
+                    // While the search field is focused, the first tap on the map
+                    // just dismisses the keyboard instead of dropping a pin. A
+                    // second tap then behaves normally.
+                    if isSearchFocused {
+                        isSearchFocused = false
+                        return
+                    }
+                    // A tap on the callout or the pin itself is the annotation's
+                    // business. The map's tap recogniser still sees those touches
+                    // (the annotation is hosted inside the map), so without this
+                    // guard tapping Copy or Save would also re-drop the pin a few
+                    // metres north of where it is.
+                    if isInsidePinAnnotation(point, proxy: proxy) {
+                        return
+                    }
+                    if let loc = proxy.convert(point, from: .local) {
+                        // A tapped point is already on screen, so there is nothing
+                        // to recentre — moving the camera here would throw away the
+                        // zoom level the user just chose.
+                        applySelection(loc, recenter: false)
+                    }
+                }
+                .mapControls {
+                    MapCompass()
+                }
+                // Remember whatever zoom the user has settled on so that a later
+                // recentre keeps it instead of snapping back to a fixed span, and
+                // bias search suggestions toward whatever is currently on screen.
+                .onMapCameraChange(frequency: .onEnd) { context in
+                    cameraSpan = context.region.span
+                    searchCompleter.update(region: context.region)
+                }
+            }
+                .ignoresSafeArea()
+
+            bottomControlCluster
+        }
+        // The controls live *above* the map inside the same ZStack, so a tap that
+        // lands on one of them is consumed there and never reaches the map's
+        // `.onTapGesture` (no accidental pin drop). Empty regions of the overlay
+        // have no background and stay transparent to hit-testing, so tapping bare
+        // map still drops a pin exactly as before.
+        .overlay(alignment: .top) {
+            mapOverlayControls
+        }
+        // iOS 26 collapses an overcrowded `.topBarLeading` group into a single "…"
+        // control, which hid every button on device. The bar carries nothing now.
+        .toolbar(.hidden, for: .navigationBar)
+        // The one and only alert on this view — the generic error/message
+        // alert, the "Save Bookmark" name prompt and the location-permission
+        // alert all come out of `pendingAlert`. See `PendingAlert` for why
+        // three stacked `.alert`s had to go.
+        //
+        // `isPresented` is derived from `pendingAlert` and its setter nils it
+        // on *every* dismissal — Save, Cancel, and SwiftUI dismissing the alert
+        // on its own — so no call site has to remember to tidy up and a stale
+        // "already presenting" state cannot survive to block the next request.
+        //
+        // The dismissal is also where a `deferredAlert` — one that arrived while
+        // this alert was on screen — gets its turn. Handing it over on the next
+        // runloop turn rather than in the setter itself lets SwiftUI finish the
+        // dismissal it is in the middle of before the next presentation starts.
+        // See `promoteDeferredAlert()` for the one case where its turn never
+        // comes.
+        .alert(
+            pendingAlert?.title ?? "",
+            isPresented: Binding(
+                get: { pendingAlert != nil },
+                set: { isPresented in
+                    guard !isPresented else { return }
+                    pendingAlert = nil
+                    promoteDeferredAlert()
+                }
+            ),
+            presenting: pendingAlert
+        ) { alert in
+            switch alert {
+            case .message:
+                Button("OK", role: .cancel) { }
+
+            // Restores the name prompt the callout's one-tap save temporarily
+            // replaced. Wording and structure match the pre-callout "Save
+            // Bookmark" alert (see git history on this file) so it still looks
+            // consistent with the rest of the app, notably `BookmarksView`'s
+            // own "Rename Bookmark" alert below. The field opens empty — see
+            // `beginSaveBookmark` — with only the "Name" placeholder as a hint.
+            case .saveBookmark:
+                TextField("Name", text: $newBookmarkName)
+                // No role, plus `.defaultAction`: renders as the bold, primary
+                // button (not `.destructive`, which would render red and
+                // wrongly read as dangerous for a save) and lets Return submit
+                // while typing. Alert button roles/style come from `role` and
+                // `.keyboardShortcut`, not `.foregroundColor`, which `.alert`
+                // ignores.
+                Button("Save") { saveCurrentPinAsBookmark() }
+                    .keyboardShortcut(.defaultAction)
+                Button("Cancel", role: .cancel) { cancelSaveBookmark() }
+
+            case .locationPermissionDenied:
+                Button("Open Settings") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                Button("Cancel", role: .cancel) { }
+            }
+        } message: { alert in
+            switch alert {
+            // Verbatim: the body arrives already localized in the payload,
+            // matching the old `Text(alertMessage)`, which was also verbatim.
+            case .message(_, let body):
+                Text(verbatim: body)
+            case .saveBookmark:
+                Text("Enter a name for this location.")
+            case .locationPermissionDenied:
+                Text("TLocation needs location access to find your current position. Note: while a simulated location is active, iOS reports the simulated position.")
+            }
+        }
+        // The one and only sheet on this view, for the same reason — see
+        // `PendingSheet`. `.sheet(item:)` nils `pendingSheet` itself on every
+        // dismissal (swipe-down included), so neither sheet can leave state
+        // behind that blocks reopening it.
+        //
+        // `onDismiss` reloads for *both* cases. Settings can import bookmarks
+        // into the store behind this view's `@State` copy, so the copy has to
+        // be refreshed the moment it closes; Bookmarks edits that same copy
+        // through a `@Binding` and persists each change immediately, so a
+        // reload there is a no-op on content but keeps the two definitively in
+        // step (and picks up anything a linked sync file changed underneath).
+        // `onDismiss` is used rather than relying on `.onAppear` firing again,
+        // which is a SwiftUI implementation detail this view should not depend
+        // on for correctness.
+        .sheet(item: $pendingSheet, onDismiss: loadBookmarks) { sheet in
+            switch sheet {
+            case .bookmarks:
+                BookmarksView(bookmarks: $bookmarks) { bookmark in
+                    applySelection(bookmark.coordinate)
+                    pendingSheet = nil
+                } onDelete: { offsets in
+                    bookmarks.remove(atOffsets: offsets)
+                    saveBookmarks()
+                } onRename: { id, newName in
+                    // Looked up by `id` here too, so the in-memory list mutated
+                    // in place and persisted stays correct regardless of the
+                    // sheet's current search filter.
+                    guard let index = bookmarks.firstIndex(where: { $0.id == id }) else { return }
+                    bookmarks[index].name = newName
+                    saveBookmarks()
+                }
+            case .settings:
+                SettingsView()
+            case .tool(let tool):
+                switch tool {
+                case .singlePoint:
+                    SinglePointToolView(initialCoordinate: coordinate) { requested in
+                        coordinate = requested
+                        recenterCamera(on: requested)
+                        simulate(at: requested)
+                    } onClear: {
+                        clear()
+                    }
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+                case .multiPoint:
+                    MultiPointToolView(initialCoordinate: coordinate) { plan in
+                        startRoute(plan)
+                    }
+                case .route:
+                    WalkingRouteToolView { plan in
+                        startRoute(plan)
+                    }
+                case .gpx:
+                    GPXImportToolView { plan in
+                        startRoute(plan)
+                    }
+                case .crossDay:
+                    CrossDayToolView { requested in
+                        coordinate = requested
+                        recenterCamera(on: requested)
+                        simulate(at: requested)
+                    }
+                    .presentationDetents([.height(590), .large])
+                    .presentationDragIndicator(.visible)
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .simulateLocationRequested)) { notification in
+            guard let requested = LocationSimulationRequest.coordinate(from: notification) else { return }
+            if LocationSimulationRequest.isAlreadyApplied(notification) {
+                adoptExternalSimulation(at: requested)
+            } else {
+                startExternalSimulation(at: requested)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .clearSimulatedLocationRequested)) { notification in
+            if LocationSimulationRequest.isAlreadyApplied(notification) {
+                adoptExternalClear()
+            } else {
+                clear()
+            }
+        }
+        .onChange(of: currentLocationProvider.currentCoordinate.map(CoordinateSnapshot.init)) { _, snapshot in
+            guard isAwaitingRealLocation,
+                  !currentLocationProvider.currentLocationIsSimulated,
+                  let realCoordinate = snapshot?.coordinate else { return }
+            isAwaitingRealLocation = false
+            recenterCamera(on: realCoordinate)
+            showStatusMessage("已恢復真實定位")
+        }
+        .onAppear {
+            loadBookmarks()
+            // A live foreground location session for as long as the map is
+            // visible. Without it the only Core Location session in the app is
+            // BackgroundLocationManager's, which `clear()` shuts down — leaving
+            // `UserAnnotation` with a stale grey dot and `.userLocation` camera
+            // positions with nothing to follow after "Return to Real Location".
+            currentLocationProvider.startTracking()
+            centerOnLaunchLocationIfNeeded()
+        }
+        .onDisappear {
+            // Balances the `startTracking()` above: no GPS runs while the map
+            // is off screen.
+            currentLocationProvider.stopTracking()
+            stopResendLoop()
+            stopRoutePlayback(resetState: true)
+            if backgroundTaskID != .invalid {
+                BackgroundLocationManager.shared.requestStop()
+            }
+            endBackgroundTask()
+        }
+    }
+
+    // MARK: - Bookmarks
+
+    private func loadBookmarks() {
+        bookmarks = BookmarkStore.load()
+    }
+
+    private func saveBookmarks() {
+        BookmarkStore.save(bookmarks)
+    }
+
+    // MARK: - Location
+
+    private func selectSearchResult(_ result: MKLocalSearchCompletion) {
+        searchText = ""
+        searchCompleter.results = []
+
+        let request = MKLocalSearch.Request(completion: result)
+        MKLocalSearch(request: request).start { response, _ in
+            if let item = response?.mapItems.first {
+                applySelection(item.placemark.coordinate)
+            }
+        }
+    }
+
+    private func applyCoordinatesFromSearchText() {
+        let importedCoordinates = CoordinateImportParser.parseInline(searchText)
+        guard let firstCoordinate = importedCoordinates.first else { return }
+
+        searchText = ""
+        searchCompleter.results = []
+        applySelection(firstCoordinate)
+    }
+
+    /// The coordinate readout and the bookmark button moved into the pin
+    /// callout, which is attached to the pin itself; what stays here is the two
+    /// actions that are about the *simulation* rather than about the pin.
+    @ViewBuilder
+    private var pinControls: some View {
+        if let statusMessage {
+            Text(statusMessage)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .transition(.opacity)
+        }
+
+        if isAwaitingRealLocation {
+            Label("已清除假定位，等待真實 GPS…", systemImage: "location.circle")
+                .font(.subheadline)
+                .foregroundStyle(.orange)
+        }
+
+        if coordinate != nil {
+            Button("開始模擬定位", action: simulate)
+                .buttonStyle(.borderedProminent)
+                .frame(maxWidth: .infinity)
+                .disabled(!pairingExists || isBusy)
+        } else if statusMessage == nil {
+            Text("先點一下地圖選擇目的地，再進入多點設定路線")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Shows a transient, non-modal message in the bottom control area (above
+    /// the Stop / Simulate buttons, or in place of the "Tap map to drop pin"
+    /// hint when there is no pin) and clears it automatically after
+    /// `statusMessageDuration`. Re-entrant: a new call
+    /// cancels any pending auto-clear from a previous message so they can't
+    /// race and wipe each other's text early.
+    private func showStatusMessage(_ message: String) {
+        statusMessageWorkItem?.cancel()
+        statusMessage = message
+        let workItem = DispatchWorkItem { statusMessage = nil }
+        statusMessageWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.statusMessageDuration, execute: workItem)
+    }
+
+    private func simulate() {
+        simulate(at: coordinate)
+    }
+
+    /// Starts a simulation requested from outside the map (e.g. the `tlocation://`
+    /// URL scheme). Routed through `simulate(at:)` so the pin, `simulatedCoordinate`,
+    /// the resend loop and the background task all end up in the same state as a
+    /// simulation started by tapping "Simulate Location".
+    private func startExternalSimulation(at requested: CLLocationCoordinate2D) {
+        guard pairingExists, !isBusy else { return }
+        stopRoutePlayback(resetState: true)
+        coordinate = requested
+        recenterCamera(on: requested)
+        simulate(at: requested)
+    }
+
+    /// Adopts a simulation a Shortcuts intent has *already* applied to the
+    /// device. The FFI is deliberately not called again — the position is
+    /// already set — but the pin, the camera, the background task and above all
+    /// the 4-second resend loop have to move onto the new coordinate, or the
+    /// loop would resend the map's older position and silently undo the
+    /// shortcut.
+    private func adoptExternalSimulation(at requested: CLLocationCoordinate2D) {
+        // Exactly one keep-alive activation should be outstanding while a
+        // simulation is running. The intent took one of its own before posting;
+        // if this view was already holding one, release it so the two do not
+        // stack and leave background location running after the next stop.
+        if hasActiveSimulation {
+            BackgroundLocationManager.shared.requestStop()
+        }
+        stopRoutePlayback(resetState: true)
+        coordinate = requested
+        recenterCamera(on: requested)
+        beginBackgroundTask()
+        startResendLoop(with: requested)
+    }
+
+    /// Counterpart of `adoptExternalSimulation`: the intent has already cleared
+    /// the device and released its keep-alive activation, so calling `clear()`
+    /// here would only re-run `clear_simulated_location()` on an already-torn-down
+    /// session — error 12 and a spurious alert.
+    ///
+    /// This is `clear()`'s success path minus the FFI call and the keep-alive
+    /// release, so the map ends up exactly where the Stop button would leave it:
+    /// resend loop stopped, background task ended, and the pin still on screen
+    /// ready to be re-simulated.
+    private func adoptExternalClear() {
+        stopResendLoop()
+        endBackgroundTask()
+    }
+
+    private func simulate(at target: CLLocationCoordinate2D?) {
+        guard pairingExists, let coord = target, !isBusy else { return }
+        stopRoutePlayback(resetState: true)
+        coordinate = coord
+        runLocationCommand(
+            errorTitle: String(localized: "Simulation Failed"),
+            errorMessage: { code in
+                String(localized: "Could not simulate location (error \(code)). Make sure the device is connected and the Developer Disk Image (DDI) is mounted.")
+            },
+            operation: { locationUpdateCode(for: coord) }
+        ) {
+            beginBackgroundTask()
+            startResendLoop(with: coord)
+            BackgroundLocationManager.shared.requestStart()
+        }
+    }
+
+    private func runLocationCommand(
+        errorTitle: String,
+        errorMessage: @escaping (Int32) -> String,
+        operation: @escaping () -> Int32,
+        onFailure: (() -> Void)? = nil,
+        onSuccess: @escaping () -> Void
+    ) {
+        isBusy = true
+        LocationSimulationCommandQueue.shared.async {
+            let code = operation()
+            DispatchQueue.main.async {
+                isBusy = false
+                if code == 0 {
+                    onSuccess()
+                    NotificationCenter.default.post(
+                        name: .locationSimulationSessionStarted,
+                        object: nil
+                    )
+                } else {
+                    onFailure?()
+                    pendingAlert = .message(title: errorTitle, body: errorMessage(code))
+                }
+            }
+        }
+    }
+
+    private func startRoute(_ plan: MobileRoutePlan) {
+        guard pairingExists, plan.coordinates.count >= 2, !isBusy else { return }
+
+        let samples = resampledRoute(plan.coordinates, speedKPH: plan.speedKPH)
+        guard samples.count >= 2 else { return }
+
+        stopResendLoop()
+        stopRoutePlayback(resetState: true)
+
+        routeCoordinates = samples
+        routeIndex = 0
+        routeName = plan.name
+        routeSpeedKPH = plan.speedKPH
+        isRoutePaused = false
+        routeNotificationSent = false
+        routeReconnectAttempts = 0
+        routeGeneration = RoutePlaybackGeneration.invalidate()
+
+        if routeNotifyAt99Percent {
+            RouteCompletionNotifier.shared.requestAuthorization()
+        }
+
+        let first = samples[0]
+        coordinate = first
+        simulatedCoordinate = first
+        recenterCamera(on: first)
+
+        runLocationCommand(
+            errorTitle: "路線啟動失敗",
+            errorMessage: { code in "無法開始路線（錯誤 \(code)）。請確認 LocalDevVPN 與 Wi-Fi。" },
+            operation: { locationUpdateCode(for: first) },
+            onFailure: { stopRoutePlayback(resetState: true) }
+        ) {
+            routeIndex = 1
+            beginBackgroundTask()
+            BackgroundLocationManager.shared.requestStart()
+            LocationSimulationSession.setMaintained(true)
+            scheduleRouteTimer()
+        }
+    }
+
+    private func scheduleRouteTimer() {
+        routeTimer?.invalidate()
+        guard hasActiveRoute, !isRoutePaused else { return }
+        routeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            advanceRoute()
+        }
+    }
+
+    private func advanceRoute() {
+        guard hasActiveRoute, !isRoutePaused, !routeTickInFlight else { return }
+        guard routeIndex < routeCoordinates.count else {
+            finishRouteAtDestination()
+            return
+        }
+
+        let index = routeIndex
+        let nextCoordinate = routeCoordinates[index]
+        let generation = routeGeneration
+        routeTickInFlight = true
+
+        LocationSimulationCommandQueue.shared.async {
+            guard RoutePlaybackGeneration.isCurrent(generation) else { return }
+            let code = locationUpdateCode(for: nextCoordinate)
+            DispatchQueue.main.async {
+                guard RoutePlaybackGeneration.isCurrent(generation) else { return }
+                routeTickInFlight = false
+                guard code == 0 else {
+                    // V1 stopped the whole route here. That made a Wi-Fi →
+                    // cellular or Airplane Mode transition impossible to
+                    // investigate: the first dropped packet erased the route
+                    // before the tunnel had a chance to rebuild. V2 holds the
+                    // current index and lets the next timer tick retry it.
+                    routeReconnectAttempts += 1
+                    LogManager.shared.addErrorLog(
+                        "Route transport interrupted (code \(code)); preserving index \(routeIndex) and retrying, attempt \(routeReconnectAttempts)"
+                    )
+                    return
+                }
+
+                routeReconnectAttempts = 0
+                coordinate = nextCoordinate
+                simulatedCoordinate = nextCoordinate
+                routeIndex = index + 1
+                sendRouteNotificationIfNeeded()
+                if routeIndex >= routeCoordinates.count {
+                    finishRouteAtDestination()
+                }
+            }
+        }
+    }
+
+    private func sendRouteNotificationIfNeeded() {
+        guard routeNotifyAt99Percent,
+              !routeNotificationSent,
+              !routeCoordinates.isEmpty,
+              Double(routeIndex) / Double(routeCoordinates.count) >= 0.99 else { return }
+
+        routeNotificationSent = true
+        RouteCompletionNotifier.shared.notifyRouteAt99Percent(name: routeName)
+    }
+
+    private func toggleRoutePause() {
+        guard hasActiveRoute else { return }
+        if isRoutePaused {
+            isRoutePaused = false
+            routeGeneration = RoutePlaybackGeneration.invalidate()
+            scheduleRouteTimer()
+        } else {
+            isRoutePaused = true
+            routeTimer?.invalidate()
+            routeTimer = nil
+            routeTickInFlight = false
+            routeGeneration = RoutePlaybackGeneration.invalidate()
+        }
+    }
+
+    private func finishRouteAtDestination() {
+        let destination = routeCoordinates.last ?? coordinate
+        stopRoutePlayback(resetState: true)
+        if let destination {
+            coordinate = destination
+            simulatedCoordinate = destination
+            startResendLoop(with: destination)
+            showStatusMessage("已抵達終點，位置保持中")
+        }
+    }
+
+    private func stopRoutePlayback(resetState: Bool) {
+        routeTimer?.invalidate()
+        routeTimer = nil
+        routeTickInFlight = false
+        routeGeneration = RoutePlaybackGeneration.invalidate()
+        LocationSimulationSession.setMaintained(false)
+
+        if resetState {
+            routeCoordinates = []
+            routeIndex = 0
+            routeName = ""
+            isRoutePaused = false
+            routeReconnectAttempts = 0
+        }
+    }
+
+    /// Converts an arbitrary polyline into roughly one coordinate per second at
+    /// the requested speed. Dense GPX files are down-sampled and sparse manual
+    /// points are interpolated, so playback speed does not depend on file shape.
+    private func resampledRoute(
+        _ source: [CLLocationCoordinate2D],
+        speedKPH: Double
+    ) -> [CLLocationCoordinate2D] {
+        guard let first = source.first, source.count >= 2 else { return source }
+        let metresPerSample = max(speedKPH, 0.5) / 3.6
+        var result = [first]
+        var remainingToSample = metresPerSample
+        var segmentStart = first
+
+        for segmentEnd in source.dropFirst() {
+            var distance = CLLocation(
+                latitude: segmentStart.latitude,
+                longitude: segmentStart.longitude
+            ).distance(from: CLLocation(latitude: segmentEnd.latitude, longitude: segmentEnd.longitude))
+
+            while distance >= remainingToSample, distance > 0 {
+                let fraction = remainingToSample / distance
+                segmentStart = CLLocationCoordinate2D(
+                    latitude: segmentStart.latitude + (segmentEnd.latitude - segmentStart.latitude) * fraction,
+                    longitude: segmentStart.longitude + (segmentEnd.longitude - segmentStart.longitude) * fraction
+                )
+                result.append(segmentStart)
+                distance = CLLocation(
+                    latitude: segmentStart.latitude,
+                    longitude: segmentStart.longitude
+                ).distance(from: CLLocation(latitude: segmentEnd.latitude, longitude: segmentEnd.longitude))
+                remainingToSample = metresPerSample
+            }
+
+            remainingToSample -= distance
+            segmentStart = segmentEnd
+        }
+
+        if let last = source.last,
+           CLLocation(latitude: result.last!.latitude, longitude: result.last!.longitude)
+            .distance(from: CLLocation(latitude: last.latitude, longitude: last.longitude)) > 0.25 {
+            result.append(last)
+        }
+        return result
+    }
+
+    private func clear(onFailure: (() -> Void)? = nil, onCleared: (() -> Void)? = nil) {
+        guard pairingExists, !isBusy else { return }
+        stopRoutePlayback(resetState: true)
+        stopResendLoop()
+        runLocationCommand(
+            errorTitle: String(localized: "Clear Failed"),
+            errorMessage: { code in
+                String(localized: "Could not clear simulated location (error \(code)).")
+            },
+            operation: { clear_simulated_location(deviceIP, pairingFilePath) },
+            onFailure: onFailure
+        ) {
+            endBackgroundTask()
+            BackgroundLocationManager.shared.requestStop()
+            // The simulated fix is gone; bounce the tracking session so the
+            // real dot arrives as soon as CoreLocation can manage rather than
+            // waiting out `distanceFilter`'s cache. Covers both the Stop
+            // button and Return to Real Location, which both funnel through
+            // this closure. No-op if tracking is not running (map off screen
+            // or no authorization yet) — see `refreshTracking()`.
+            currentLocationProvider.refreshTracking()
+            onCleared?()
+        }
+    }
+
+    private func beginBackgroundTask() {
+        guard backgroundTaskID == .invalid else { return }
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask { endBackgroundTask() }
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+
+    private func startResendLoop(with coordinate: CLLocationCoordinate2D) {
+        simulatedCoordinate = coordinate
+        consecutiveResendFailures = 0
+        resendTimer?.invalidate()
+        // Starts a new run, and in doing so retires any tick still queued from
+        // the previous one — `simulate()` reaches here without going through
+        // `stopResendLoop()` when the user re-simulates while already running,
+        // so a tick carrying the *old* anchor could otherwise land after the
+        // new one. See `ResendGeneration`.
+        let generation = ResendGeneration.invalidate()
+        LocationSimulationSession.setMaintained(true)
+        resendTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { _ in
+            guard let simulatedCoordinate else { return }
+            // `simulatedCoordinate` is the fixed anchor set above (or in
+            // `adoptExternalSimulation`) and is never overwritten by a
+            // jittered value, so every tick wobbles around the same point
+            // instead of drifting further away over time. Read live so
+            // flipping the setting mid-simulation takes effect on the very
+            // next resend.
+            let sendCoordinate = naturalGPSDrift
+                ? jitteredCoordinate(around: simulatedCoordinate)
+                : simulatedCoordinate
+            LocationSimulationCommandQueue.shared.async {
+                // The last gate before anything reaches the device. This tick
+                // may have been sitting behind a minutes-long rebuild; if the
+                // run it belongs to has ended in the meantime — Stop, Return to
+                // Real Location, a Shortcut's clear, the map going off screen,
+                // or the app concluding the simulation is dead — it must not
+                // simulate anything, least of all resurrect a simulation the
+                // user has already been told is over.
+                guard ResendGeneration.isCurrent(generation) else { return }
+                let code = locationUpdateCode(for: sendCoordinate)
+                // The verdict is reached here, on the queue that runs the ticks,
+                // not on the main thread: if this is the failure that ends the
+                // run, `record` retires the run before returning, which is
+                // before this block returns, which is before the serial queue
+                // can start the next tick. See `ResendGeneration`.
+                let outcome = ResendGeneration.record(
+                    code: code,
+                    for: generation,
+                    limit: Self.resendFailureLimit
+                )
+                // The result used to be discarded here. A session that had died
+                // then failed on every tick in complete silence — no log line
+                // from this loop, no alert, and a map that went on showing an
+                // active simulation the device had already stopped honouring.
+                DispatchQueue.main.async {
+                    handleResendResult(code, generation: generation, outcome: outcome)
+                }
+            }
+        }
+    }
+
+    /// Applies one resend's already-decided outcome, on the main thread.
+    ///
+    /// This only *reports* the verdict — the streak was counted and the run
+    /// retired on `LocationSimulationCommandQueue`, in the tick's own block, so
+    /// that no queued tick could slip through between the decision and its
+    /// enforcement. See `ResendGeneration`.
+    ///
+    /// Success is deliberately silent: at one tick every four seconds, logging
+    /// those would bury everything else in the log within minutes. Failures are
+    /// logged individually with their code — `simulate_location` has already
+    /// written the line explaining what that code means and which call produced
+    /// it, so this one only has to say that a *resend* was what hit it and how
+    /// close the run is to the limit.
+    private func handleResendResult(_ code: Int32, generation: UInt64, outcome: ResendGeneration.Outcome) {
+        // Results are matched to the run that asked for them by identity, not by
+        // "is *a* simulation running". A failure from a run that has since been
+        // stopped (Stop, Return to Real Location, a Shortcut's clear, the map
+        // going off screen) must not count toward anything; and if the user has
+        // started a *new* simulation in the meantime, a straight `!= nil` check
+        // would let the dead run's failure count toward the fresh run's streak
+        // and drag it toward a false "Simulation Stopped".
+        //
+        // A concluded run is checked against the generation its own retirement
+        // produced, not the one the tick was scheduled under — that one is stale
+        // by construction now. Anything that bumped again in the meantime (Stop,
+        // a Shortcut's clear, a fresh simulation) has already done its own
+        // teardown and outranks this verdict.
+        switch outcome {
+        case .stale:
+            return
+
+        case .succeeded:
+            guard isCurrentRun(generation) else { return }
+            consecutiveResendFailures = 0
+
+        case .failed(let streak):
+            guard isCurrentRun(generation) else { return }
+            consecutiveResendFailures = streak
+            logResendFailure(code: code, streak: streak)
+
+        case .concluded(let streak, let successor):
+            guard isCurrentRun(successor) else { return }
+            consecutiveResendFailures = streak
+            logResendFailure(code: code, streak: streak)
+            concludeSimulationHasStopped()
+        }
+    }
+
+    private func isCurrentRun(_ generation: UInt64) -> Bool {
+        ResendGeneration.isCurrent(generation) && simulatedCoordinate != nil
+    }
+
+    private func logResendFailure(code: Int32, streak: Int) {
+        LogManager.shared.addWarningLog(
+            "Location resend failed (code \(code)) — consecutive failure \(streak) of \(Self.resendFailureLimit); see the simulate_location line above for what this code means"
+        )
+    }
+
+    /// Stops claiming a simulation the app can no longer sustain, and tells the
+    /// user why.
+    ///
+    /// **State correction only — nothing is sent to the device in either
+    /// direction.** No re-simulate: `simulate_location` has already retried the
+    /// user's exact anchor on every one of the failing ticks that got us here
+    /// (it rebuilds tunnel, remote server and session before reporting failure,
+    /// and logs both the rebuild and its outcome), so an extra attempt from here
+    /// would repeat work that has just been refused three times, and any attempt
+    /// this function *could* make would have to invent its own coordinate at some
+    /// point in the future — the shape of change this project has already had to
+    /// revert once. And no clear: `clear_simulated_location()` stays reachable
+    /// only from a deliberate user action.
+    ///
+    /// The pin is left on the map, so "Simulate Location" is right there to try
+    /// again with the same point once the connection is back.
+    private func concludeSimulationHasStopped() {
+        LogManager.shared.addErrorLog(
+            "Location resends failed \(Self.resendFailureLimit) times in a row; TLocation is no longer treating the simulation as running. No command was sent to the device."
+        )
+        // The ticks queued behind the slow failures that got us here were
+        // already retired on the command queue, in the block of the tick that
+        // produced this verdict — none of them can still reach the FFI by the
+        // time this runs (see `ResendGeneration`). What is left for here is the
+        // main-thread half: killing the timer, dropping the anchor, and
+        // retracting `LocationSimulationSession.isMaintained`, which is what
+        // releases the deferred tunnel rebuild below.
+        stopResendLoop()
+        endBackgroundTask()
+        BackgroundLocationManager.shared.requestStop()
+        // Same reasoning as `clear()`'s success path: whatever the device is
+        // reporting now, this app should stop sitting on a cached simulated fix.
+        currentLocationProvider.refreshTracking()
+        // Three full RemotePairing rebuilds to <targetIP>:49152 have just been
+        // refused. `TunnelManager.isConnected` latches on the last success and
+        // is cleared by nothing but an explicit retry or a pairing import, so
+        // without this it would go on claiming a connection that three attempts
+        // in a row could not make — and the readiness overlay, which is the only
+        // place Retry and Open LocalDevVPN exist, renders solely when something
+        // is *not* ready. Recording what was just observed is the opposite of
+        // fabricating state: it only ever moves the app toward "not ready", it
+        // sends nothing to the device, and it is what puts a way back on screen
+        // instead of leaving the next tap on Simulate Location to produce a bare
+        // "error 3" with no guidance attached.
+        markTunnelDisconnected()
+        presentAlert(.message(
+            title: String(localized: "Simulation Stopped"),
+            body: String(localized: "TLocation lost the location-simulation session on this device and could not rebuild it, so the position is no longer being kept up to date — the device has most likely returned to its real location. Nothing was sent to the device. Reconnect LocalDevVPN, then tap Retry to reconnect before simulating again.")
+        ))
+    }
+
+    /// Puts `alert` on screen, or in the one-deep waiting room if this view is
+    /// already presenting one.
+    ///
+    /// For alerts the user did not ask for — `concludeSimulationHasStopped()` is
+    /// the only one — because assigning `pendingAlert` while an alert is up does
+    /// not swap the alert's content, and the dismissal of the alert that *is* up
+    /// then nils the assignment, so the notification is simply never seen. Every
+    /// other call site sets `pendingAlert` directly: those all run from a tap on
+    /// this view, which cannot happen while an alert is covering it.
+    ///
+    /// One alert deep is the whole design: there is exactly one unsolicited
+    /// alert in this view, so a queue would only add ways for it to get stuck.
+    /// The single `.alert` modifier and the single "what is on screen" variable
+    /// are untouched.
+    private func presentAlert(_ alert: PendingAlert) {
+        if pendingAlert == nil {
+            pendingAlert = alert
+        } else {
+            deferredAlert = alert
+        }
+    }
+
+    /// Gives the waiting-room alert its turn once the one that was on screen has
+    /// gone — unless it has stopped being true in the meantime.
+    ///
+    /// The only thing that ever waits here is `concludeSimulationHasStopped()`'s
+    /// "Simulation Stopped" (see `presentAlert(_:)`), and the wait is
+    /// open-ended: it lasts as long as the user leaves the other alert up. A
+    /// Shortcut or a `tlocation://` link can start a fresh simulation in that
+    /// window — `startExternalSimulation` gates on `isBusy`, not on what is on
+    /// screen — and then the queued notice would announce the end of a
+    /// simulation that is running again, with Stop enabled right behind it.
+    /// Better said nothing than said wrongly, so it is dropped rather than
+    /// shown; the log line the conclusion wrote is still there, and the run it
+    /// described really did end.
+    private func promoteDeferredAlert() {
+        guard let queued = deferredAlert else { return }
+        deferredAlert = nil
+        guard !hasActiveSimulation else { return }
+        DispatchQueue.main.async { pendingAlert = queued }
+    }
+
+    /// Returns `anchor` offset by a small, realistic amount of consumer-GPS
+    /// noise (a uniformly random radius of 3–5 m in a uniformly random
+    /// direction, so the offset varies every call and never exceeds ~5 m).
+    /// Only ever used for the bytes sent to the device on a resend — never
+    /// for the pin, the anchor itself, or anything shown in the UI.
+    ///
+    /// Metres are converted to degrees using ~111,320 m per degree of
+    /// latitude; longitude is additionally scaled by `cos(latitude)` since a
+    /// degree of longitude shrinks toward the poles (e.g. ~7% shorter at
+    /// Hanoi's ~21°N, ~2x shorter at 60°N) — skipping that scaling would make
+    /// the east/west component of the wobble increasingly wrong away from
+    /// the equator.
+    private func jitteredCoordinate(around anchor: CLLocationCoordinate2D) -> CLLocationCoordinate2D {
+        let metersPerDegreeLatitude = 111_320.0
+        let radiusMeters = Double.random(in: 3...5)
+        let angle = Double.random(in: 0..<(2 * .pi))
+        let eastMeters = radiusMeters * cos(angle)
+        let northMeters = radiusMeters * sin(angle)
+
+        let deltaLatitude = northMeters / metersPerDegreeLatitude
+        let metersPerDegreeLongitude = metersPerDegreeLatitude * cos(anchor.latitude * .pi / 180)
+        let deltaLongitude = metersPerDegreeLongitude != 0 ? eastMeters / metersPerDegreeLongitude : 0
+
+        return CLLocationCoordinate2D(
+            latitude: anchor.latitude + deltaLatitude,
+            longitude: anchor.longitude + deltaLongitude
+        )
+    }
+
+    private func stopResendLoop() {
+        resendTimer?.invalidate()
+        resendTimer = nil
+        simulatedCoordinate = nil
+        consecutiveResendFailures = 0
+        // The timer only owed us future ticks; these two are what disarm the
+        // ticks already dispatched onto the command queue (`ResendGeneration`)
+        // and let the deferred tunnel rebuild in `TLocationApp` know that
+        // nothing is maintaining a simulation any more.
+        //
+        // Retiring from the main thread is the right move for every caller of
+        // this function — Stop, Return to Real Location, a Shortcut's clear, the
+        // map going off screen, a re-simulate — because each of those is itself
+        // a main-thread decision that no tick is racing to make. The one
+        // decision that *is* made mid-queue, the three-failure verdict, retires
+        // the run on the queue before it ever gets here; this bump is then just
+        // the next one along.
+        ResendGeneration.invalidate()
+        LocationSimulationSession.setMaintained(false)
+    }
+
+    /// - Parameter recenter: `true` for programmatic selections (search result,
+    ///   bookmark, Locate Me, typed coordinate, URL scheme), which may target a
+    ///   point that is off screen. Pass `false` for map taps, where the point is
+    ///   already visible and moving the camera would destroy the user's zoom.
+    private func applySelection(_ coordinate: CLLocationCoordinate2D, recenter: Bool = true) {
+        self.coordinate = coordinate
+        if recenter {
+            recenterCamera(on: coordinate)
+        }
+    }
+
+    /// Recentres on `target` while preserving the current zoom span. Falls back to
+    /// the historical 1000 m × 1000 m framing only if the camera has not reported a
+    /// region yet.
+    private func recenterCamera(on target: CLLocationCoordinate2D) {
+        if let cameraSpan {
+            position = .region(MKCoordinateRegion(center: target, span: cameraSpan))
+        } else {
+            position = .region(
+                MKCoordinateRegion(
+                    center: target,
+                    latitudinalMeters: 1000,
+                    longitudinalMeters: 1000
+                )
+            )
+        }
+    }
+
+    /// Stops the simulation and hands the camera back to the user's live
+    /// position. No polling and no distance comparison: the map already
+    /// renders `UserAnnotation()`, so once iOS actually releases the
+    /// simulated fix the blue dot — and now the camera, following it — settle
+    /// onto the real position by themselves, however long that takes. This is
+    /// self-healing by construction, so there is nothing to retry and nothing
+    /// to alert about beyond a genuine FFI failure (handled by `clear()`'s own
+    /// alert).
+    ///
+    /// This relies on `currentLocationProvider`'s tracking session, started in
+    /// `.onAppear` and only stopped in `.onDisappear`. It therefore outlives
+    /// the `BackgroundLocationManager.requestStop()` that `clear()` performs —
+    /// a different `CLLocationManager` entirely — so a live session is
+    /// guaranteed to be running at the moment the camera is handed back to
+    /// `.userLocation` below.
+    private func returnToRealLocation() {
+        // Mirrors `clear()`'s own guard, so the spinner flag below can never be
+        // left set by a call that clear() drops on the floor.
+        guard pairingExists, !isBusy else { return }
+        // Clear the pin immediately so no stale marker can mislead the user
+        // while the simulation is torn down.
+        coordinate = nil
+        isReturningToRealLocation = true
+        isAwaitingRealLocation = true
+        clear {
+            isReturningToRealLocation = false
+            isAwaitingRealLocation = false
+        } onCleared: {
+            isReturningToRealLocation = false
+            // MapKit may keep reporting the final GPX point while real GPS is
+            // waking up. Do not chase that stale dot; the onChange above waits
+            // for a fix Core Location identifies as non-simulated.
+            showStatusMessage("假定位已清除，正在等待真實 GPS")
+        }
+    }
+
+    private func performLocate() {
+        currentLocationProvider.locate { result in
+            switch result {
+            case .success(let coordinate):
+                applySelection(coordinate)
+                Haptics.medium()
+            case .failure(.denied):
+                pendingAlert = .locationPermissionDenied
+            case .failure(.unavailable):
+                pendingAlert = .message(
+                    title: String(localized: "Could Not Determine Location"),
+                    body: String(localized: "No GPS fix was available. Try again, ideally with a clear view of the sky.")
+                )
+            }
+        }
+    }
+
+    /// One-shot: centres the map on the user's real position at a comfortable
+    /// street-level zoom the first time the map appears, instead of leaving
+    /// `.userLocation(fallback: .automatic)` to pick an overly wide zoom.
+    /// Runs at most once per app launch and never while a simulation is
+    /// active, so it can never yank the camera away from what the user is
+    /// doing. Silent on any failure (permission denied, restricted, or no
+    /// fix) — the permission-denied alert stays reserved for an explicit tap
+    /// on Locate Me.
+    private func centerOnLaunchLocationIfNeeded() {
+        guard !hasCenteredOnLaunch, !hasActiveSimulation else { return }
+        hasCenteredOnLaunch = true
+        currentLocationProvider.locate { result in
+            guard case .success(let coordinate) = result, !hasActiveSimulation else { return }
+            let region = MKCoordinateRegion(
+                center: coordinate,
+                latitudinalMeters: Self.defaultSpanMeters,
+                longitudinalMeters: Self.defaultSpanMeters
+            )
+            position = .region(region)
+            cameraSpan = region.span
+        }
+    }
+
+    private func locationUpdateCode(for coordinate: CLLocationCoordinate2D) -> Int32 {
+        simulate_location(deviceIP, coordinate.latitude, coordinate.longitude, pairingFilePath)
+    }
+}
+
+// MARK: - Bookmarks Sheet
+
+struct BookmarksView: View {
+    @Binding var bookmarks: [LocationBookmark]
+    let onSelect: (LocationBookmark) -> Void
+    let onDelete: (IndexSet) -> Void
+    /// Called with the bookmark's stable `id` (never a list index) and the
+    /// already-trimmed/fallback-applied new name.
+    let onRename: (UUID, String) -> Void
+
+    @State private var searchText = ""
+    // The bookmark being renamed is tracked by `id`, not by its position in
+    // `filteredBookmarks` — the same trap already fixed for delete. A search
+    // can hide earlier entries, so "the first visible row" and "the first
+    // bookmark overall" are not the same thing.
+    @State private var renamingBookmarkID: UUID?
+    @State private var renameText = ""
+    @State private var showRenameAlert = false
+
+    /// Bookmarks matching `searchText` by name or formatted coordinate,
+    /// preserving `bookmarks`' order. `localizedStandardContains` is
+    /// case- *and* diacritic-insensitive, which matters for names like
+    /// "Hà Nội" that should still match a plain "ha noi" query.
+    private var filteredBookmarks: [LocationBookmark] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return bookmarks }
+        return bookmarks.filter { bookmark in
+            bookmark.name.localizedStandardContains(query) ||
+            formattedCoordinate(bookmark).localizedStandardContains(query)
+        }
+    }
+
+    private func formattedCoordinate(_ bookmark: LocationBookmark) -> String {
+        String(format: "%.6f, %.6f", bookmark.latitude, bookmark.longitude)
+    }
+
+    /// `offsets` indexes into the filtered/displayed list, not `bookmarks`
+    /// itself, so it is remapped by identity before being handed to
+    /// `onDelete` — otherwise, with an active filter hiding earlier entries,
+    /// deleting a visible row would remove the wrong bookmark.
+    private func deleteFiltered(at offsets: IndexSet) {
+        let idsToDelete = Set(offsets.map { filteredBookmarks[$0].id })
+        let originalOffsets = IndexSet(bookmarks.indices.filter { idsToDelete.contains(bookmarks[$0].id) })
+        onDelete(originalOffsets)
+    }
+
+    /// Used by the explicit swipe-action Delete button (as opposed to the
+    /// implicit `.onDelete` swipe/edit-mode affordance), which already has
+    /// the exact bookmark in hand and can map straight to `bookmarks` by
+    /// `id` without going through a filtered-list offset at all.
+    private func deleteBookmark(_ bookmark: LocationBookmark) {
+        guard let index = bookmarks.firstIndex(where: { $0.id == bookmark.id }) else { return }
+        onDelete(IndexSet(integer: index))
+    }
+
+    /// Called from a swipe action / context menu on a specific row, so
+    /// `bookmark` is already the correct one regardless of any active search
+    /// filter — it came straight from that row's `ForEach` element, not from
+    /// an index into `bookmarks`.
+    private func beginRename(_ bookmark: LocationBookmark) {
+        renamingBookmarkID = bookmark.id
+        renameText = bookmark.name
+        showRenameAlert = true
+    }
+
+    /// Looks the target back up by `id` (never by position) before applying
+    /// the edit, since `filteredBookmarks` may have reordered or hidden
+    /// entries relative to `bookmarks` by the time Save is tapped.
+    private func commitRename() {
+        defer {
+            renamingBookmarkID = nil
+            renameText = ""
+        }
+        guard let id = renamingBookmarkID,
+              let bookmark = bookmarks.first(where: { $0.id == id }) else { return }
+        let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newName = trimmed.isEmpty
+            ? String(format: "%.4f, %.4f", bookmark.latitude, bookmark.longitude)
+            : trimmed
+        onRename(id, newName)
+    }
+
+    var body: some View {
+        NavigationStack {
+            if bookmarks.isEmpty {
+                ContentUnavailableView(
+                    "No Bookmarks",
+                    systemImage: "bookmark.slash",
+                    description: Text("Drop a pin on the map and tap the bookmark icon to save a location.")
+                )
+                .navigationTitle("Bookmarks")
+                .navigationBarTitleDisplayMode(.inline)
+            } else {
+                Group {
+                    if filteredBookmarks.isEmpty {
+                        ContentUnavailableView(
+                            "No Matches",
+                            systemImage: "magnifyingglass",
+                            description: Text("No bookmarks match \"\(searchText)\".")
+                        )
+                    } else {
+                        List {
+                            ForEach(filteredBookmarks) { bookmark in
+                                Button {
+                                    // Renaming never touches selection: this
+                                    // action only fires from a direct tap on
+                                    // the row body, not from the swipe
+                                    // action or context menu below.
+                                    onSelect(bookmark)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(bookmark.name)
+                                            .foregroundStyle(.primary)
+                                        Text(formattedCoordinate(bookmark))
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                // Trailing swipe replaces the implicit
+                                // onDelete swipe action for this edge, so
+                                // Delete is re-added explicitly alongside
+                                // Rename to avoid losing swipe-to-delete.
+                                // EditButton's edit-mode delete affordance is
+                                // unaffected — that comes from `.onDelete`
+                                // below, independent of `.swipeActions`.
+                                .swipeActions(edge: .trailing) {
+                                    Button(role: .destructive) {
+                                        deleteBookmark(bookmark)
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                    Button {
+                                        beginRename(bookmark)
+                                    } label: {
+                                        Label("Rename", systemImage: "pencil")
+                                    }
+                                    .tint(.blue)
+                                }
+                                .contextMenu {
+                                    Button {
+                                        beginRename(bookmark)
+                                    } label: {
+                                        Label("Rename", systemImage: "pencil")
+                                    }
+                                }
+                            }
+                            .onDelete(perform: deleteFiltered)
+                        }
+                    }
+                }
+                .navigationTitle("Bookmarks")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    EditButton()
+                }
+                .searchable(text: $searchText, prompt: "Search bookmarks")
+            }
+        }
+        .alert("Rename Bookmark", isPresented: $showRenameAlert) {
+            TextField("Name", text: $renameText)
+            // Same treatment as the callout's "Save Bookmark" alert: no role
+            // (not `.destructive`, which would render red) plus
+            // `.defaultAction` for the bold primary-button style and
+            // Return-to-submit.
+            Button("Save") { commitRename() }
+                .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) {
+                renamingBookmarkID = nil
+                renameText = ""
+            }
+        } message: {
+            Text("Enter a new name for this location.")
+        }
+    }
+}
